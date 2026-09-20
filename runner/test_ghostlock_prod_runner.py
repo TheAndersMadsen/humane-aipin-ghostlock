@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -151,6 +155,69 @@ class ProdRunnerTest(unittest.TestCase):
             expected_payload_sha256=self.PAYLOAD_SHA256,
         )
 
+    def assert_process_gone(self, pid: int) -> None:
+        deadline = time.monotonic() + 1.0
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            if time.monotonic() >= deadline:
+                self.fail(f"helper process {pid} was not reaped")
+            time.sleep(0.01)
+
+    def run_hanging_helper(self, *, close_stdout: bool) -> int:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log_path = root / "stream.log"
+            close_statement = "os.close(1);os.close(2);" if close_stdout else ""
+            helper = (
+                "import os, time;"
+                f"{close_statement}"
+                "time.sleep(60)"
+            )
+            processes: list[subprocess.Popen[str]] = []
+            real_popen = subprocess.Popen
+
+            def start_helper(*args, **kwargs):
+                kwargs["preexec_fn"] = lambda: signal.signal(
+                    signal.SIGTERM, signal.SIG_IGN
+                )
+                process = real_popen(*args, **kwargs)
+                processes.append(process)
+                return process
+
+            def kill_helper_if_needed() -> None:
+                if not processes:
+                    return
+                try:
+                    os.kill(processes[0].pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+            self.addCleanup(kill_helper_if_needed)
+            with (
+                mock.patch.object(
+                    RUNNER.subprocess, "Popen", side_effect=start_helper
+                ),
+                mock.patch.object(
+                    RUNNER, "STREAM_TERMINATE_GRACE_SECONDS", 0.05
+                ),
+                mock.patch.object(RUNNER, "STREAM_REAP_GRACE_SECONDS", 0.5),
+                self.assertRaisesRegex(
+                    RUNNER.RunnerError, "exploit command exceeded"
+                ),
+            ):
+                RUNNER.stream_process(
+                    [sys.executable, "-c", helper],
+                    log_path,
+                    timeout=0.5,
+                )
+
+            self.assertEqual(len(processes), 1)
+            self.assert_process_gone(processes[0].pid)
+            return processes[0].pid
+
     def test_capture_state_uses_two_adb_commands_and_preserves_fields(self) -> None:
         adb = RecordingAdb(self.snapshot_text())
 
@@ -167,6 +234,75 @@ class ProdRunnerTest(unittest.TestCase):
         self.assertEqual(state.kernel_release, self.PROFILE.kernel_release)
         self.assertEqual(state.payload_sha256, self.PAYLOAD_SHA256)
         self.assertEqual(state.uptime_seconds, 1000.25)
+
+    def test_stream_process_reaps_no_output_hang_after_deadline(self) -> None:
+        self.run_hanging_helper(close_stdout=False)
+
+    def test_stream_process_reaps_stdout_closed_hang_after_deadline(self) -> None:
+        self.run_hanging_helper(close_stdout=True)
+
+    def test_stream_cleanup_kills_term_ignoring_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            child_pid_path = Path(directory) / "child.pid"
+            child = (
+                "import os, pathlib, signal, sys, time;"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()));"
+                "time.sleep(60)"
+            )
+            leader = (
+                "import subprocess, sys, time;"
+                "subprocess.Popen([sys.executable, '-c', sys.argv[1], "
+                "sys.argv[2]], stdout=subprocess.DEVNULL, "
+                "stderr=subprocess.DEVNULL);"
+                "time.sleep(60)"
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", leader, child, str(child_pid_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                start_new_session=True,
+            )
+
+            def kill_group_if_needed() -> None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+            self.addCleanup(kill_group_if_needed)
+            deadline = time.monotonic() + 2.0
+            while not child_pid_path.is_file() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(child_pid_path.is_file(), "descendant was not ready")
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+
+            with (
+                mock.patch.object(
+                    RUNNER, "STREAM_TERMINATE_GRACE_SECONDS", 0.05
+                ),
+                mock.patch.object(RUNNER, "STREAM_REAP_GRACE_SECONDS", 0.5),
+            ):
+                cleanup_error = RUNNER._stop_and_reap_stream_process(
+                    process, None
+                )
+
+            self.assertIsNone(cleanup_error)
+            self.assert_process_gone(process.pid)
+            self.assert_process_gone(child_pid)
+
+    def test_stream_process_rejects_non_utf8_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "stream.log"
+            with self.assertRaisesRegex(
+                RUNNER.RunnerError, "could not read exploit output"
+            ):
+                RUNNER.stream_process(
+                    [sys.executable, "-c", "import os; os.write(1, b'\\xff')"],
+                    log_path,
+                    timeout=1.0,
+                )
 
     def test_capture_state_rejects_duplicate_tag(self) -> None:
         snapshot = self.snapshot_text()

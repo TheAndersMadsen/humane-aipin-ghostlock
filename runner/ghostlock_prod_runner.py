@@ -49,6 +49,8 @@ FORBIDDEN_ADB_SUBCOMMANDS = frozenset(("root", "unroot"))
 PROFILES_ROOT = ROOT / "profiles"
 PHASE_DURATION_NAMES = frozenset(("preflight", "exploit", "verification"))
 STATE_SNAPSHOT_PREFIX = "GHOSTLOCK_STATE_V1"
+STREAM_TERMINATE_GRACE_SECONDS = 5.0
+STREAM_REAP_GRACE_SECONDS = 10.0
 STATE_SNAPSHOT_FIELDS = (
     "boot_id_begin",
     "boot_epoch_begin",
@@ -545,48 +547,176 @@ def build_exploit_argv(
     ]
 
 
-def stream_process(command: list[str], log_path: Path, timeout: int) -> int:
-    output_queue: queue.Queue[str | None] = queue.Queue()
-    with log_path.open("w", encoding="utf-8") as log:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
+def _signal_process_group(process: subprocess.Popen[str], sig: int) -> str | None:
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        return None
+    except OSError as exc:
+        return f"could not send signal {sig} to process group: {exc}"
+    return None
+
+
+def _process_group_exists(process: subprocess.Popen[str]) -> bool:
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _stop_and_reap_stream_process(
+    process: subprocess.Popen[str], reader_thread: threading.Thread | None
+) -> str | None:
+    errors: list[str] = []
+    if _process_group_exists(process):
+        signal_error = _signal_process_group(process, signal.SIGTERM)
+        if signal_error is not None:
+            errors.append(signal_error)
+
+        terminate_deadline = (
+            time.monotonic() + STREAM_TERMINATE_GRACE_SECONDS
         )
+        while _process_group_exists(process):
+            remaining = terminate_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            interval = min(0.05, remaining)
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=interval)
+                except subprocess.TimeoutExpired:
+                    pass
+            elif reader_thread is not None and reader_thread.is_alive():
+                reader_thread.join(timeout=interval)
+            else:
+                time.sleep(interval)
+
+    if _process_group_exists(process):
+        signal_error = _signal_process_group(process, signal.SIGKILL)
+        if signal_error is not None:
+            errors.append(signal_error)
+
+    try:
+        process.wait(timeout=STREAM_REAP_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        errors.append("process did not exit after SIGKILL")
+
+    if reader_thread is not None:
+        reader_thread.join(timeout=STREAM_REAP_GRACE_SECONDS)
+        if reader_thread.is_alive():
+            errors.append("output reader did not stop after process exit")
+
+    group_deadline = time.monotonic() + STREAM_REAP_GRACE_SECONDS
+    while _process_group_exists(process) and time.monotonic() < group_deadline:
+        time.sleep(
+            min(0.05, max(0.0, group_deadline - time.monotonic()))
+        )
+    if _process_group_exists(process):
+        errors.append("process group did not exit after SIGKILL")
+
+    if reader_thread is None or not reader_thread.is_alive():
+        if process.stdout is not None:
+            process.stdout.close()
+
+    return "; ".join(errors) or None
+
+
+def stream_process(command: list[str], log_path: Path, timeout: float) -> int:
+    output_queue: queue.Queue[str | None] = queue.Queue()
+    reader_errors: list[Exception] = []
+    with log_path.open("w", encoding="utf-8") as log:
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise RunnerError(f"could not start exploit command: {exc}") from exc
+
+        thread: threading.Thread | None = None
 
         def reader() -> None:
             assert process.stdout is not None
-            for line in process.stdout:
-                output_queue.put(line.replace("\r", ""))
-            output_queue.put(None)
-
-        thread = threading.Thread(target=reader, daemon=True)
-        thread.start()
-        deadline = time.monotonic() + timeout
-        stream_closed = False
-        while not stream_closed:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                raise RunnerError(f"exploit command exceeded {timeout} seconds")
             try:
-                line = output_queue.get(timeout=min(1.0, remaining))
-            except queue.Empty:
-                continue
-            if line is None:
-                stream_closed = True
-                continue
+                for line in process.stdout:
+                    output_queue.put(line.replace("\r", ""))
+            except Exception as exc:
+                reader_errors.append(exc)
+            finally:
+                output_queue.put(None)
+
+        def emit(line: str) -> None:
             print(line, end="", flush=True)
             log.write(line)
             log.flush()
-        return process.wait(timeout=10)
+
+        def drain_output() -> None:
+            while True:
+                try:
+                    line = output_queue.get_nowait()
+                except queue.Empty:
+                    return
+                if line is not None:
+                    emit(line)
+
+        try:
+            reader_thread = threading.Thread(target=reader, daemon=True)
+            reader_thread.start()
+            thread = reader_thread
+            deadline = time.monotonic() + timeout
+            stream_closed = False
+            while process.poll() is None or not stream_closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RunnerError(
+                        f"exploit command exceeded {timeout} seconds"
+                    )
+                try:
+                    line = output_queue.get(timeout=min(1.0, remaining))
+                except queue.Empty:
+                    continue
+                if line is None:
+                    stream_closed = True
+                else:
+                    emit(line)
+
+            thread.join(timeout=STREAM_REAP_GRACE_SECONDS)
+            if thread.is_alive():
+                raise RunnerError("exploit output reader did not stop")
+            drain_output()
+            if reader_errors:
+                raise RunnerError(
+                    f"could not read exploit output: {reader_errors[0]}"
+                )
+            assert process.returncode is not None
+            return process.returncode
+        except BaseException as exc:
+            cleanup_error = _stop_and_reap_stream_process(process, thread)
+            drain_output()
+            if cleanup_error is not None:
+                if isinstance(exc, RunnerError):
+                    raise RunnerError(
+                        f"{exc}; cleanup failed: {cleanup_error}"
+                    ) from exc
+                raise RunnerError(
+                    f"exploit command cleanup failed: {cleanup_error}"
+                ) from exc
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            if isinstance(exc, RunnerError):
+                raise
+            raise RunnerError(f"exploit command failed: {exc}") from exc
+        finally:
+            if thread is not None and not thread.is_alive():
+                if process.stdout is not None and not process.stdout.closed:
+                    process.stdout.close()
 
 
 def kaslr_json(result: KaslrResult) -> dict[str, object]:
