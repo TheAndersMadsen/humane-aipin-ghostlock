@@ -7,7 +7,26 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  host-tests-macos:
+    name: macOS host tests
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify host-only tests and privacy audit
+        run: |
+          python3 scripts/release_audit.py
+          python3 -m unittest discover -s tools -p 'test_*.py' -v
+          python3 -m unittest discover -s runner -p 'test_*.py' -v
+          make -C source test
+
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -15,7 +34,7 @@ jobs:
       NDK_ROOT: /usr/local/lib/android/sdk/ndk/28.2.13676358
     steps:
       - name: Check out source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Ensure pinned Android NDK
         run: |

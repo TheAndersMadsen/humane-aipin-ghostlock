@@ -24,7 +24,8 @@ anything. A mismatch stops the run.
 | Android | 12 |
 | Kernel | `4.14.190-perf`, built `Mon Nov 4 18:37:23 PST 2024` |
 | Slot | `_b` only |
-| Architecture | `aarch64` |
+| Kernel architecture | `aarch64` |
+| Android ABI | `arm64-v8a` |
 | Profile | `humane-aipin-45.20` |
 | Kernel Image SHA-256 | `d4f4e0deb20871fce207f1f095ba1934162081c2f10afaccbb2e6a1e938719fb` |
 | Release-candidate replay | Pending final clean-boot replay |
@@ -139,7 +140,7 @@ After a normal reboot, root is gone. The staged files may remain inert under
 `/data/local/tmp`; a clean shell can remove them:
 
 ```sh
-adb -s YOUR_SERIAL shell +  'rm -f /data/local/tmp/ghostlock-aipin.so /data/local/tmp/su +         /data/local/tmp/.ghostlock-su.sock +         /data/local/tmp/.ghostlock-aipin-attempt'
+adb -s YOUR_SERIAL shell 'rm -f /data/local/tmp/ghostlock-aipin.so /data/local/tmp/su /data/local/tmp/.ghostlock-su.sock /data/local/tmp/.ghostlock-aipin-attempt'
 ```
 
 Read [SAFETY.md](docs/SAFETY.md) before using the PoC and
@@ -154,7 +155,7 @@ attach that directory or a raw Android bugreport to an issue.
 Create a reduced report instead:
 
 ```sh
-./ghostlock report /private/tmp/ghostlock-aipin-TIMESTAMP +  --output ghostlock-report.json
+./ghostlock report /private/tmp/ghostlock-aipin-TIMESTAMP --output ghostlock-report.json
 ```
 
 Review the JSON before sharing it. The redactor omits serials, boot IDs, host

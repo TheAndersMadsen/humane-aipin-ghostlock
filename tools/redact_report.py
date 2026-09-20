@@ -107,7 +107,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     if args.output:
-        args.output.write_text(rendered + "\n", encoding="utf-8")
+        try:
+            args.output.write_text(rendered + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"ERROR: cannot write reduced report: {exc}", file=sys.stderr)
+            return 2
+        print(
+            f"Reduced report written to {args.output}; review it before sharing.",
+            file=sys.stderr,
+        )
     else:
         print(rendered)
     return 0

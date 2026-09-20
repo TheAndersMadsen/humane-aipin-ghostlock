@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 
 
@@ -63,6 +65,18 @@ class RedactionTests(unittest.TestCase):
             self.assertNotIn(private_path, rendered)
             self.assertNotIn("ffffffaa", rendered)
             self.assertTrue(json.loads(rendered)["acceptance_ok"])
+
+    def test_output_write_failure_is_reported_without_a_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "manifest.json").write_text("{}", encoding="utf-8")
+            stderr = io.StringIO()
+
+            with redirect_stderr(stderr):
+                result = REDACTOR.main([str(root), "--output", str(root)])
+
+            self.assertEqual(result, 2)
+            self.assertIn("cannot write reduced report", stderr.getvalue())
 
 
 if __name__ == "__main__":
