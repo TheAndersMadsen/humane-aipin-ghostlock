@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
- * Humane AI Pin retail target profile for 101.000470.45.20, slot _b.
+ * Humane AI Pin retail target implementation for 101.000470.45.20.
  *
  * Link-time symbols were independently derived from the exact kernel Image.
  * The Image is deliberately not distributed with this project.
@@ -8,15 +8,10 @@
 #ifndef GHOSTLOCK_AIPIN_TARGET_H
 #define GHOSTLOCK_AIPIN_TARGET_H
 
-#define BUILD_VARIANT_LABEL "humane_aipin_101.000470.45.20_slot_b"
-#define BUILD_FINGERPRINT \
-  "qti/atoll/atoll:12/SKQ1.230401.001/101.000470.45.20:user/release-keys"
-#define BUILD_SLOT "_b"
-#define BUILD_ABI "arm64-v8a"
-#define TARGET_KERNEL_IMAGE_SHA256 \
-  "d4f4e0deb20871fce207f1f095ba1934162081c2f10afaccbb2e6a1e938719fb"
-#define TARGET_KERNEL_RELEASE "Linux version 4.14.190-perf"
-#define TARGET_KERNEL_BUILD_MARKER "Mon Nov 4 18:37:23 PST 2024"
+/* Intentional cross-check: these offsets belong only to this exact Image. */
+#define TARGET_LAYOUT_IMAGE_SHA256 "d4f4e0deb20871fce207f1f095ba1934162081c2f10afaccbb2e6a1e938719fb"
+
+#include "ghostlock_profile_generated.h"
 
 #define KIMAGE_TEXT_BASE 0xffffff8008080000ULL
 #define P0_PAGE_OFFSET 0xffffffc000000000ULL

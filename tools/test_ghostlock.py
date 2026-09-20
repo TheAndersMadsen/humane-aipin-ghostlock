@@ -27,56 +27,63 @@ class BatteryParsingTests(unittest.TestCase):
 
 
 class TargetTests(unittest.TestCase):
+    PROFILES = GHOSTLOCK.load_profiles(GHOSTLOCK.PROFILES_ROOT)
+    PROFILE = PROFILES[0]
+
+    def info(self, **overrides):
+        values = {
+            "serial": "TESTSERIAL",
+            "fingerprint": self.PROFILE.fingerprint,
+            "kernel": (
+                f"Linux localhost {self.PROFILE.kernel_release} "
+                f"{self.PROFILE.kernel_build_marker} aarch64"
+            ),
+            "kernel_release": self.PROFILE.kernel_release,
+            "slot": self.PROFILE.accepted_slots[0],
+            "abi": self.PROFILE.accepted_abis[0],
+            "uid": "2000",
+            "context": "u:r:shell:s0",
+            "selinux": "Enforcing",
+            "battery_level": 100,
+            "powered": True,
+        }
+        values.update(overrides)
+        return GHOSTLOCK.DeviceInfo(**values)
+
     def test_exact_profile_is_supported_and_clean(self) -> None:
-        info = GHOSTLOCK.DeviceInfo(
-            serial="TESTSERIAL",
-            fingerprint=GHOSTLOCK.SUPPORTED_FINGERPRINT,
-            kernel=f"Linux localhost {GHOSTLOCK.SUPPORTED_KERNEL_MARKER} aarch64",
-            slot="_b",
-            abi=GHOSTLOCK.SUPPORTED_ABI,
-            uid="2000",
-            context="u:r:shell:s0",
-            selinux="Enforcing",
-            battery_level=100,
-            powered=True,
-        )
-        self.assertTrue(info.supported)
-        self.assertEqual(info.compatibility_mismatches, ())
+        info = self.info()
+        profile, mismatches = GHOSTLOCK.evaluate_device(info, self.PROFILES)
+        self.assertEqual(profile, self.PROFILE)
+        self.assertEqual(mismatches, ())
         self.assertTrue(info.clean_shell)
 
     def test_nearby_firmware_is_rejected(self) -> None:
-        info = GHOSTLOCK.DeviceInfo(
-            serial="TESTSERIAL",
-            fingerprint=GHOSTLOCK.SUPPORTED_FINGERPRINT.replace("45.20", "45.21"),
-            kernel=f"Linux localhost {GHOSTLOCK.SUPPORTED_KERNEL_MARKER} aarch64",
-            slot="_b",
-            abi=GHOSTLOCK.SUPPORTED_ABI,
-            uid="2000",
-            context="u:r:shell:s0",
-            selinux="Enforcing",
-            battery_level=100,
-            powered=True,
+        info = self.info(
+            fingerprint=self.PROFILE.fingerprint.replace("45.20", "45.21")
         )
-        self.assertFalse(info.supported)
-        self.assertIn("firmware fingerprint", info.compatibility_mismatches[0])
+        profile, mismatches = GHOSTLOCK.evaluate_device(info, self.PROFILES)
+        self.assertIsNone(profile)
+        self.assertIn("firmware fingerprint", mismatches[0])
 
     def test_unproven_slot_a_is_rejected(self) -> None:
-        info = GHOSTLOCK.DeviceInfo(
-            serial="TESTSERIAL",
-            fingerprint=GHOSTLOCK.SUPPORTED_FINGERPRINT,
-            kernel=f"Linux localhost {GHOSTLOCK.SUPPORTED_KERNEL_MARKER} aarch64",
-            slot="_a",
-            abi=GHOSTLOCK.SUPPORTED_ABI,
-            uid="2000",
-            context="u:r:shell:s0",
-            selinux="Enforcing",
-            battery_level=100,
-            powered=True,
-        )
-        self.assertFalse(info.supported)
+        info = self.info(slot="_a")
+        profile, mismatches = GHOSTLOCK.evaluate_device(info, self.PROFILES)
+        self.assertIsNone(profile)
         self.assertEqual(
-            info.compatibility_mismatches,
+            mismatches,
             ("active slot: expected '_b', observed '_a'",),
+        )
+
+    def test_nearby_kernel_release_is_rejected(self) -> None:
+        info = self.info(kernel_release=f"{self.PROFILE.kernel_release}-different")
+        profile, mismatches = GHOSTLOCK.evaluate_device(info, self.PROFILES)
+        self.assertIsNone(profile)
+        self.assertEqual(
+            mismatches,
+            (
+                "kernel release: expected '4.14.190-perf', "
+                "observed '4.14.190-perf-different'",
+            ),
         )
 
 

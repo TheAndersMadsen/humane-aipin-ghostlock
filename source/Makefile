@@ -5,9 +5,14 @@ API := 35
 PROJECT ?= humane-aipin-45.20
 OUTDIR ?= build/$(PROJECT)/bin
 EMBEDDIR ?= build/embed
+PROFILE_MANIFEST ?= ../profiles/humane-45.20/profile.json
+PROFILE_SYMBOLS := $(dir $(PROFILE_MANIFEST))symbols.txt
+PROFILE_GENERATED_DIR := build/$(PROJECT)/generated
+PROFILE_HEADER := $(PROFILE_GENERATED_DIR)/ghostlock_profile_generated.h
 
 TARGET_DIR := src/targets/$(PROJECT)
 TARGET_HEADER := $(TARGET_DIR)/target.h
+TARGET_SUPPORT_FILES := $(wildcard $(TARGET_DIR)/*.h $(TARGET_DIR)/*.json)
 
 ifeq ($(wildcard $(TARGET_HEADER)),)
 $(error unknown PROJECT=$(PROJECT), missing $(TARGET_HEADER))
@@ -91,9 +96,12 @@ COMMON_CFLAGS := -O2 -g0 -Wall -Wextra -Isrc
 PIE_CFLAGS := -fPIE -pie $(COMMON_CFLAGS)
 SO_CFLAGS := -fPIC $(COMMON_CFLAGS)
 WARN_CFLAGS := -Wno-unused-parameter -Wno-sign-compare -Wno-unused-function
-TARGET_CFLAGS := -DTARGET_CONFIG_H=\"targets/$(PROJECT)/target.h\"
+TARGET_CFLAGS := -DTARGET_CONFIG_H=\"targets/$(PROJECT)/target.h\" \
+  -I$(PROFILE_GENERATED_DIR)
 
-.PHONY: all preload test clean info list-projects
+.PHONY: all preload test clean info list-projects FORCE
+
+FORCE:
 
 all: preload
 
@@ -105,11 +113,20 @@ $(OUTDIR):
 $(EMBEDDIR):
 	mkdir -p $@
 
-$(EMBED_SU): $(call pick_src,su_daemon.c) | $(EMBEDDIR)
+$(PROFILE_GENERATED_DIR):
+	mkdir -p $@
+
+$(PROFILE_HEADER): FORCE $(PROFILE_MANIFEST) $(PROFILE_SYMBOLS) $(TARGET_HEADER) \
+  ../ghostlock_profile.py ../scripts/generate_profile_header.py | $(PROFILE_GENERATED_DIR)
+	python3 ../scripts/generate_profile_header.py \
+	  --profile $(PROFILE_MANIFEST) --project $(PROJECT) \
+	  --target-header $(TARGET_HEADER) --output $@
+
+$(EMBED_SU): $(call pick_src,su_daemon.c) $(PROFILE_HEADER) | $(EMBEDDIR)
 	$(TARGET_CC) $(TARGET_FLAGS) $(PIE_CFLAGS) $(TARGET_CFLAGS) \
 	  $< $(TARGET_PIE_LDFLAGS) -o $@
 
-$(PRELOAD): $(PRELOAD_SRCS) $(EMBED_SU) $(TARGET_HEADER) src/offset.h src/kernelsnitch/*.h | $(OUTDIR)
+$(PRELOAD): $(PRELOAD_SRCS) $(EMBED_SU) $(TARGET_SUPPORT_FILES) $(PROFILE_HEADER) src/offset.h src/kernelsnitch/*.h | $(OUTDIR)
 	$(TARGET_CC) $(TARGET_FLAGS) $(SO_CFLAGS) $(WARN_CFLAGS) $(TARGET_CFLAGS) \
 	  $(PRELOAD_SRCS) $(TARGET_COMMON_LDFLAGS) \
 	  -shared -o $@ -pthread
@@ -118,7 +135,7 @@ $(PRELOAD): $(PRELOAD_SRCS) $(EMBED_SU) $(TARGET_HEADER) src/offset.h src/kernel
 build/tests:
 	mkdir -p $@
 
-build/tests/perf_reclaim_gate_test: tests/perf_reclaim_gate_test.c src/perf_reclaim_math.c src/perf_reclaim_gate.h | build/tests
+build/tests/perf_reclaim_gate_test: tests/perf_reclaim_gate_test.c src/perf_reclaim_math.c src/perf_reclaim_gate.h $(PROFILE_HEADER) | build/tests
 	$(HOST_CC) -std=c11 -O2 -Wall -Wextra -Werror -Isrc $(TARGET_CFLAGS) tests/perf_reclaim_gate_test.c src/perf_reclaim_math.c -o $@
 
 build/tests/reclaim_hold_test: tests/reclaim_hold_test.c src/reclaim_hold.c src/reclaim_hold.h | build/tests
@@ -141,6 +158,8 @@ info:
 	@echo "TARGET_PIE_LDFLAGS=$(TARGET_PIE_LDFLAGS)"
 	@echo "PRELOAD=$(PRELOAD)"
 	@echo "EMBED_SU=$(EMBED_SU)"
+	@echo "PROFILE_MANIFEST=$(PROFILE_MANIFEST)"
+	@echo "PROFILE_HEADER=$(PROFILE_HEADER)"
 	@echo "CORE_SRCS=$(CORE_SRCS)"
 
 list-projects:

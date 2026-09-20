@@ -40,10 +40,23 @@ static int get_property(const char *name, char value[PROP_VALUE_MAX]) {
   return 1;
 }
 
+static int string_in_profile(const char *value, const char *const *accepted,
+                             size_t accepted_count) {
+  for (size_t index = 0; index < accepted_count; ++index) {
+    if (strcmp(value, accepted[index]) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int verify_live_target(void) {
+  static const char *const accepted_slots[] = BUILD_SLOTS;
+  static const char *const accepted_abis[] = BUILD_ABIS;
   char fingerprint[PROP_VALUE_MAX];
   char slot[PROP_VALUE_MAX];
   char abi[PROP_VALUE_MAX];
+  char release[128];
   char version[512];
   char context[128];
   char enforcing[16];
@@ -51,28 +64,31 @@ static int verify_live_target(void) {
   get_property("ro.build.fingerprint", fingerprint);
   get_property("ro.boot.slot_suffix", slot);
   get_property("ro.product.cpu.abi", abi);
+  read_first_line("/proc/sys/kernel/osrelease", release, sizeof(release));
   read_first_line("/proc/version", version, sizeof(version));
   read_first_line("/proc/self/attr/current", context, sizeof(context));
   read_first_line("/sys/fs/selinux/enforce", enforcing, sizeof(enforcing));
 
   int valid = strcmp(fingerprint, BUILD_FINGERPRINT) == 0 &&
-              strcmp(slot, BUILD_SLOT) == 0 &&
-              strcmp(abi, BUILD_ABI) == 0 &&
-              strstr(version, TARGET_KERNEL_RELEASE) != NULL &&
+              string_in_profile(slot, accepted_slots, BUILD_SLOT_COUNT) &&
+              string_in_profile(abi, accepted_abis, BUILD_ABI_COUNT) &&
+              strcmp(release, TARGET_KERNEL_RELEASE) == 0 &&
               strstr(version, TARGET_KERNEL_BUILD_MARKER) != NULL &&
               getuid() == 2000 && geteuid() == 2000 &&
               strcmp(context, "u:r:shell:s0") == 0 &&
               strcmp(enforcing, "1") == 0;
   if (!valid) {
-    pr_warning("target gate rejected fingerprint=%s slot=%s abi=%s uid=%u/%u "
-               "context=%s enforcing=%s version=%s\n",
-               fingerprint, slot, abi, getuid(), geteuid(), context, enforcing,
-               version);
+    pr_warning("target gate rejected fingerprint=%s slot=%s abi=%s release=%s "
+               "uid=%u/%u context=%s enforcing=%s version=%s\n",
+               fingerprint, slot, abi, release, getuid(), geteuid(), context,
+               enforcing, version);
     return 0;
   }
 
-  pr_success("target kernel accepted profile=%s slot=%s image_sha256=%s\n",
-             BUILD_VARIANT_LABEL, slot, TARGET_KERNEL_IMAGE_SHA256);
+  pr_success("target kernel accepted profile=%s manifest_sha256=%s "
+             "image_sha256=%s symbols_sha256=%s slot=%s abi=%s\n",
+             BUILD_VARIANT_LABEL, PROFILE_MANIFEST_SHA256,
+             TARGET_KERNEL_IMAGE_SHA256, PROFILE_SYMBOLS_SHA256, slot, abi);
   return 1;
 }
 

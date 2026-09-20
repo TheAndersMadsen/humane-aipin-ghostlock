@@ -12,6 +12,9 @@ python3 -m unittest discover -s runner -p 'test_*.py' -v
 make -C source test
 
 ./ghostlock build
+python3 scripts/verify_payload_profile.py \
+  --profile profiles/humane-45.20/profile.json \
+  --payload source/build/humane-aipin-45.20/bin/preload.so
 cp source/build/humane-aipin-45.20/bin/preload.so "$temporary_dir/first.so"
 ./ghostlock build
 cmp "$temporary_dir/first.so" source/build/humane-aipin-45.20/bin/preload.so

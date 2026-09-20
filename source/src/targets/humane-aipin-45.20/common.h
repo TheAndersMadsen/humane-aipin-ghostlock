@@ -46,13 +46,16 @@
 
 #include "kernelsnitch/utils.h"
 
-/* mm_struct is 0x370 bytes and occupies a 0x380-byte SLUB slot. */
-#define MM_STRUCT_OBJECT_SZ 0x370
-#define MM_STRUCT_SZ 0x380
-#define MM_ORDER 3
+/* Profile-bound mm_struct object and SLUB geometry. */
+#define MM_STRUCT_OBJECT_SZ PROFILE_MM_OBJECT_SIZE
+#define MM_STRUCT_SZ PROFILE_MM_SLAB_SIZE
+#define MM_ORDER PROFILE_MM_ORDER
 #define MM_PREPARE_SLABS_MIN 16
 #define MM_PREPARE_SLABS_MAX 64
 #define ORDER3_SIZE (PAGE_SIZE << MM_ORDER)
+
+_Static_assert((ORDER3_SIZE / MM_STRUCT_SZ) == PROFILE_MM_OBJECTS_PER_SLAB,
+               "profile mm_struct objects-per-slab mismatch");
 
 #define CORE 0
 #define CONSUMER_CORE 1

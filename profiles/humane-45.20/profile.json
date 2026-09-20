@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "profile_id": "humane-aipin-45.20-nov4",
+  "product": "Humane AI Pin retail",
+  "project": "humane-aipin-45.20",
+  "fingerprint": "qti/atoll/atoll:12/SKQ1.230401.001/101.000470.45.20:user/release-keys",
+  "kernel_release": "4.14.190-perf",
+  "kernel_build_marker": "#1 SMP PREEMPT Mon Nov 4 18:37:23 PST 2024",
+  "kernel_image_sha256": "d4f4e0deb20871fce207f1f095ba1934162081c2f10afaccbb2e6a1e938719fb",
+  "accepted_slots": [
+    "_b"
+  ],
+  "accepted_abis": [
+    "arm64-v8a"
+  ],
+  "symbols_file": "symbols.txt",
+  "symbols_sha256": "b6bc1dccc155de70881b0abfe708a0e3dba626b819dc03d56686ab9c07517f9b",
+  "allocator_geometry": {
+    "object_size": 880,
+    "slab_size": 896,
+    "order": 3,
+    "objects_per_slab": 36,
+    "cpu_partial": 13
+  }
+}
