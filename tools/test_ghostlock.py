@@ -41,6 +41,7 @@ class TargetTests(unittest.TestCase):
             powered=True,
         )
         self.assertTrue(info.supported)
+        self.assertEqual(info.compatibility_mismatches, ())
         self.assertTrue(info.clean_shell)
 
     def test_nearby_firmware_is_rejected(self) -> None:
@@ -57,6 +58,7 @@ class TargetTests(unittest.TestCase):
             powered=True,
         )
         self.assertFalse(info.supported)
+        self.assertIn("firmware fingerprint", info.compatibility_mismatches[0])
 
     def test_unproven_slot_a_is_rejected(self) -> None:
         info = GHOSTLOCK.DeviceInfo(
@@ -72,6 +74,10 @@ class TargetTests(unittest.TestCase):
             powered=True,
         )
         self.assertFalse(info.supported)
+        self.assertEqual(
+            info.compatibility_mismatches,
+            ("active slot: expected '_b', observed '_a'",),
+        )
 
 
 if __name__ == "__main__":

@@ -54,13 +54,31 @@ class DeviceInfo:
     powered: bool | None
 
     @property
+    def compatibility_mismatches(self) -> tuple[str, ...]:
+        mismatches: list[str] = []
+        if self.fingerprint != SUPPORTED_FINGERPRINT:
+            mismatches.append(
+                "firmware fingerprint: "
+                f"expected {SUPPORTED_FINGERPRINT!r}, observed {self.fingerprint!r}"
+            )
+        if SUPPORTED_KERNEL_MARKER not in self.kernel:
+            mismatches.append(
+                "kernel build: "
+                f"required marker {SUPPORTED_KERNEL_MARKER!r}, observed {self.kernel!r}"
+            )
+        if self.slot != SUPPORTED_SLOT:
+            mismatches.append(
+                f"active slot: expected {SUPPORTED_SLOT!r}, observed {self.slot!r}"
+            )
+        if self.abi != SUPPORTED_ABI:
+            mismatches.append(
+                f"ABI: expected {SUPPORTED_ABI!r}, observed {self.abi!r}"
+            )
+        return tuple(mismatches)
+
+    @property
     def supported(self) -> bool:
-        return (
-            self.fingerprint == SUPPORTED_FINGERPRINT
-            and SUPPORTED_KERNEL_MARKER in self.kernel
-            and self.slot == SUPPORTED_SLOT
-            and self.abi == SUPPORTED_ABI
-        )
+        return not self.compatibility_mismatches
 
     @property
     def clean_shell(self) -> bool:
@@ -186,6 +204,8 @@ def print_device(info: DeviceInfo) -> None:
     print(f"SELinux:     {info.selinux}")
     print(f"Battery:     {battery}, external power {power}")
     print(f"Profile:     {'supported' if info.supported else 'UNSUPPORTED'}")
+    for mismatch in info.compatibility_mismatches:
+        print(f"Mismatch:    {mismatch}")
 
 
 def find_ndk(explicit: str | None) -> Path | None:
@@ -262,9 +282,11 @@ def build_payload(ndk_arg: str | None) -> str:
 
 def require_target(info: DeviceInfo, *, min_battery: int) -> None:
     if not info.supported:
+        details = "; ".join(info.compatibility_mismatches)
         raise GhostLockError(
             "unsupported device or firmware; this PoC accepts only Humane retail "
-            "45.20 on slot _b with the exact profiled kernel"
+            "45.20 on slot _b with the exact profiled kernel. "
+            f"Mismatch: {details}"
         )
     if not info.clean_shell:
         raise GhostLockError(
