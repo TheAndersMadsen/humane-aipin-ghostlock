@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private security report
+    url: https://github.com/TheAndersMadsen/humane-aipin-ghostlock/security/advisories/new
+    about: Report vulnerabilities or sensitive misuse concerns privately.

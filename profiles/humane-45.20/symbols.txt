@@ -1,0 +1,13 @@
+ffffff8008080000 T _text
+ffffff8008080800 T _stext
+ffffff8008247148 T free_pgtables
+ffffff8008253630 T exit_mmap
+ffffff8009b2a0b0 D __entry_task
+ffffff8009dbf6d0 D __per_cpu_offset
+ffffff8009dc36e8 d loggers
+ffffff8009dc37c8 d nfulnl_logger
+ffffff8009dcdb80 D init_task
+ffffff8009ddeec0 D init_cred
+ffffff8009ea1f50 D random_table
+ffffff8009fe9f00 B root_task_group
+ffffff800a4cd000 B selinux_state

@@ -1,0 +1,26 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      NDK_ROOT: /usr/local/lib/android/sdk/ndk/28.2.13676358
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned Android NDK
+        run: sdkmanager "ndk;28.2.13676358"
+
+      - name: Verify tests, privacy audit, and reproducible build
+        run: |
+          chmod +x ghostlock scripts/verify-release.sh
+          ./scripts/verify-release.sh

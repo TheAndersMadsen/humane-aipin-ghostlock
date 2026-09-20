@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Modified for the Humane AI Pin vendor 4.14 futex key and hash table.
+ */
 #pragma once
 
 #include "utils.h"
@@ -184,12 +187,42 @@ typedef union {
     } both;
 } futex_key_t;
 
+/*
+ * Vendor 4.14 futex key + hash (slot-a disasm, re-verified 2026-09-19
+ * from Image_dev_a_unc; get_futex_key @ 0xffffff8008193df0, private
+ * path @ 0x114050, hash_futex inlined into futex_wait_setup @ 0x113898):
+ *
+ *   get_futex_key prologue:
+ *     and  w8,  w20, #0xfff
+ *     str  w8,  [x19, #0x10]     key->offset = uaddr & 0xfff (NO flag bit!)
+ *     sub  x20, x20, x8          address = uaddr & ~0xfff   (PAGE-MASKED)
+ *   !fshared path (0x114050):
+ *     stp  x23, x20, [x19]       key = { current->mm @0, page(uaddr) @8 }
+ *   The `orr w8, w8, #2` at 0xffffff8008194274 belongs to the PageAnon
+ *   SHARED (fshared=1) path only; private futexes do NOT set bit 1.
+ *
+ *   hash_futex (inlined @ 0x113898):
+ *     ldr  w8, [x19, #0x48]      initval = key->both.offset
+ *     mov  w12, #0xbeff; movk w12, #0xdead, lsl #16   (0xdeadBEFF =
+ *                                0xdeadbeef + 16 = INITVAL + length<<2)
+ *     ... jhash2(key, 4 words, offset) ...
+ *     and  x8, x10, x8           bucket = hash & (futex_hashsize - 1)
+ *     add  x22, x9, x8, lsl #7   bucket struct = 128 bytes
+ *
+ * So the private key = { mm, page(uaddr), uaddr & 0xfff } and the hash
+ * is the STANDARD upstream jhash2 over the first 16 bytes with
+ * key->offset as initval.  The previous model in this file (FULL uaddr
+ * @8 plus offset|2) hashed the wrong bytes for every private futex and
+ * made the STAGE-B 5-equality search unsatisfiable (diag counters
+ * showed an exactly-random distribution; leaked stayed -1 forever).
+ *
+ * futex_hashsize = roundup_pow_of_two(256 * num_possible_cpus())
+ * = 2048 for 8 possible CPUs (/sys/devices/system/cpu/possible = 0-7);
+ * AI_PIN_KS_HASHSIZE can override for experiments.
+ */
 uint32_t futex_hash_no_trunc(futex_key_t *key)
 {
-    uint32_t hash = jhash2((uint32_t *)key, OFFSET_OF(typeof(*key), both.offset) / 4,
-              key->both.offset);
-
-    return hash;
+    return jhash2((uint32_t *)key, 4, key->both.offset);
 }
 
 uint32_t __futex_hash(futex_key_t *key, uint32_t futex_hashsize)
@@ -202,14 +235,39 @@ uint32_t __futex_hash(futex_key_t *key, uint32_t futex_hashsize)
 unsigned long futex_hashsize = (unsigned long)-1;
 void futex_init(void)
 {
-    futex_hashsize = SYSCHK(sysconf(_SC_NPROCESSORS_ONLN) * 256);
+    unsigned long n_possible = 8;
+    FILE *f = fopen("/sys/devices/system/cpu/possible", "r");
+    if (f) {
+        int lo = -1, hi = -1;
+        if (fscanf(f, "%d-%d", &lo, &hi) == 2 && lo >= 0 && hi >= lo &&
+            hi < 1024) {
+            n_possible = (unsigned long)(hi - lo + 1);
+        }
+        fclose(f);
+    }
+    unsigned long want = 256 * n_possible;
+    unsigned long shift = 0;
+    while ((1UL << shift) < want) {
+        shift++;
+    }
+    futex_hashsize = 1UL << shift;
+    /* Experiment override: e.g. AI_PIN_KS_HASHSIZE=2048 */
+    const char *hs_env = getenv("AI_PIN_KS_HASHSIZE");
+    if (hs_env && *hs_env) {
+        unsigned long hs = strtoul(hs_env, NULL, 0);
+        if (hs && (hs & (hs - 1)) == 0) {
+            futex_hashsize = hs;
+            pr_warning("KS hashsize override=%lu\n", hs);
+        }
+    }
 }
 uint32_t futex_hash(size_t addr, size_t mm)
 {
     ASSERT_pr((futex_hashsize != (unsigned long)-1), "need to call futex_init() first\n");
     futex_key_t key;
+    memset(&key, 0, sizeof(key));
     key.private.mm = (void *)mm;
-    key.private.address = addr & ~KS_PAGE_MASK;
-    key.private.offset = addr & KS_PAGE_MASK;
+    key.private.address = addr & ~(size_t)KS_PAGE_MASK;  /* page-masked (disasm 0x113e80) */
+    key.private.offset = addr & KS_PAGE_MASK;            /* NO |2 flag for private futexes */
     return __futex_hash(&key, futex_hashsize);
 }

