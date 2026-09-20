@@ -31,6 +31,12 @@ class BatteryParsingTests(unittest.TestCase):
     def test_missing_values_remain_unknown(self) -> None:
         self.assertEqual(GHOSTLOCK.parse_battery("status: 2\n"), (None, None))
 
+    def test_out_of_range_level_is_unknown(self) -> None:
+        self.assertEqual(
+            GHOSTLOCK.parse_battery("USB powered: true\nlevel: 101\n"),
+            (None, True),
+        )
+
 
 class HostDiagnosticsTests(unittest.TestCase):
     @staticmethod
@@ -329,6 +335,32 @@ class TargetTests(unittest.TestCase):
         profile, mismatches = GHOSTLOCK.evaluate_device(info, self.PROFILES)
         self.assertIsNone(profile)
         self.assertIn("kernel identity", mismatches[0])
+
+
+class LauncherSafetyTests(unittest.TestCase):
+    PROFILE = GHOSTLOCK.load_profiles(GHOSTLOCK.PROFILES_ROOT)[0]
+
+    def test_runner_receives_selected_minimum_battery(self) -> None:
+        command = GHOSTLOCK.build_runner_argv(
+            serial="TESTSERIAL",
+            profile=self.PROFILE,
+            payload_sha256="a" * 64,
+            output_dir=Path("/private/tmp/ghostlock-test"),
+            min_battery=37,
+            retain_bugreport=False,
+        )
+
+        index = command.index("--min-battery")
+        self.assertEqual(command[index + 1], "37")
+        self.assertEqual(command.count("--min-battery"), 1)
+
+    def test_minimum_battery_is_bounded(self) -> None:
+        self.assertEqual(GHOSTLOCK.min_battery_value("0"), 0)
+        self.assertEqual(GHOSTLOCK.min_battery_value("100"), 100)
+        for value in ("-1", "101", "unknown"):
+            with self.subTest(value=value):
+                with self.assertRaises(GHOSTLOCK.argparse.ArgumentTypeError):
+                    GHOSTLOCK.min_battery_value(value)
 
 
 if __name__ == "__main__":

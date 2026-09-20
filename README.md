@@ -90,7 +90,10 @@ status. Its diagnostic output masks the device serial by default.
 `ROOT YOUR_SERIAL`, builds from source, verifies the payload hash after
 pushing it, captures a current-boot bugreport to derive KASLR, deletes that raw
 bugreport by default, and starts the exploit only after a second complete
-preflight.
+preflight. The launcher requires at least 20% battery and external power by
+default, then the runner rechecks both immediately before it consumes the
+boot's single attempt. `--min-battery 0` disables both power gates and is
+intended only when stable power has been confirmed independently.
 
 `verify` independently asks the boot-scoped root broker to run `id` and
 `getenforce`.
@@ -145,10 +148,12 @@ restart, so recovery may require waiting for the battery to drain before
 reconnecting power.
 
 After a normal reboot, root is gone. The staged files may remain inert under
-`/data/local/tmp`; a clean shell can remove them:
+`/data/local/tmp`; a clean shell can remove them, including the boot-specific
+atomic attempt claims:
 
 ```sh
 adb -s YOUR_SERIAL shell 'rm -f /data/local/tmp/ghostlock-aipin.so /data/local/tmp/su /data/local/tmp/.ghostlock-su.sock /data/local/tmp/.ghostlock-aipin-attempt'
+adb -s YOUR_SERIAL shell 'rm -rf /data/local/tmp/.ghostlock-aipin-attempt.*.lock'
 ```
 
 Read [SAFETY.md](docs/SAFETY.md) before using the PoC and
@@ -167,7 +172,10 @@ Create a reduced report instead:
 ```
 
 Review the JSON before sharing it. The redactor omits serials, boot IDs, host
-paths, raw command output, and kernel addresses. See [PRIVACY.md](docs/PRIVACY.md).
+paths, raw command output, and kernel addresses. It includes fixed monotonic
+durations for the preflight, exploit, verification, and total run so failures
+can be compared without sharing device evidence. See
+[PRIVACY.md](docs/PRIVACY.md).
 
 ## Build and test
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ PROOF_PATTERNS = {
     ),
     "root_daemon": r"direct-root-summary root=1 id=1 su=1/",
 }
+SAFE_PHASE_DURATIONS = ("preflight", "exploit", "verification", "total")
 
 
 class ReportError(RuntimeError):
@@ -37,6 +39,23 @@ def safe_state(value: object) -> dict[str, object] | None:
         "payload_sha256",
     )
     return {key: value[key] for key in allowed if key in value}
+
+
+def safe_phase_durations(value: object) -> dict[str, float] | None:
+    if not isinstance(value, dict):
+        return None
+    safe: dict[str, float] = {}
+    for key in SAFE_PHASE_DURATIONS:
+        duration = value.get(key)
+        if not isinstance(duration, (int, float)) or isinstance(duration, bool):
+            continue
+        try:
+            numeric = float(duration)
+        except (OverflowError, ValueError):
+            continue
+        if math.isfinite(numeric) and numeric >= 0:
+            safe[key] = round(numeric, 3)
+    return safe
 
 
 def load_private_run(path: Path) -> tuple[dict[str, object], str]:
@@ -92,6 +111,9 @@ def redact(path: Path) -> dict[str, object]:
         "mm_geometry": manifest.get("mm_geometry"),
         "preflight": manifest.get("preflight"),
         "bugreport_binding": manifest.get("bugreport_binding"),
+        "phase_durations_seconds": safe_phase_durations(
+            manifest.get("phase_durations_seconds")
+        ),
         "kaslr_anchor_count": len(anchors),
         "kaslr_anchor_symbols": symbols,
         "exploit_returncode": manifest.get("exploit_returncode"),

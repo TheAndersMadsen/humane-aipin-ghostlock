@@ -13,7 +13,7 @@ attempt.
 
 The check must show:
 
-- the exact supported fingerprint and kernel marker;
+- the exact supported fingerprint, kernel version, and machine;
 - slot `_b`;
 - UID 2000 in `u:r:shell:s0`;
 - SELinux `Enforcing`;
@@ -25,9 +25,15 @@ offset while retaining the same Android and kernel version strings.
 
 ## One attempt per boot
 
-The runner writes a boot-bound marker before entering the corruption stage. A
-second attempt on the same boot is rejected. Reboot after any failure,
-disconnect, timeout, or result you cannot explain.
+Immediately before writing the boot-bound marker, the runner rechecks battery
+level and external power using the launcher's `--min-battery` threshold. An
+unavailable reading, a low level, or disconnected power stops the run without
+consuming the attempt. A threshold of zero explicitly disables this power
+gate. The runner then atomically creates a boot-specific claim directory, so
+concurrent runners cannot both enter the corruption stage. It never removes a
+stale claim while a run is in progress. After the claim is acquired, a second
+attempt on the same boot is rejected. Reboot after any failure, disconnect,
+timeout, or result you cannot explain.
 
 This rule matters because a failed route may leave allocator or rtmutex state
 changed even when user space still appears healthy.

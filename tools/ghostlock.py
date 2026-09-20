@@ -38,10 +38,21 @@ RUNNER = ROOT / "runner/ghostlock_prod_runner.py"
 REDACTOR = ROOT / "tools/redact_report.py"
 REMOTE_PAYLOAD = "/data/local/tmp/ghostlock-aipin.so"
 REMOTE_SU = "/data/local/tmp/su"
+DEFAULT_MIN_BATTERY = 20
 
 
 class GhostLockError(RuntimeError):
     pass
+
+
+def min_battery_value(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer from 0 to 100") from exc
+    if not 0 <= parsed <= 100:
+        raise argparse.ArgumentTypeError("must be between 0 and 100")
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -175,6 +186,8 @@ def select_serial(requested: str | None) -> str:
 def parse_battery(text: str) -> tuple[int | None, bool | None]:
     level_match = re.search(r"(?m)^\s*level:\s*(\d+)\s*$", text)
     level = int(level_match.group(1)) if level_match else None
+    if level is not None and not 0 <= level <= 100:
+        level = None
     power_matches = re.findall(
         r"(?mi)^\s*(?:AC|USB|Wireless) powered:\s*(true|false)\s*$", text
     )
@@ -351,6 +364,8 @@ def require_target(
     *,
     min_battery: int,
 ) -> TargetProfile:
+    if not 0 <= min_battery <= 100:
+        raise GhostLockError("minimum battery must be between 0 and 100")
     profile, mismatches = evaluate_device(info, profiles)
     if profile is None:
         details = "; ".join(mismatches)
@@ -491,6 +506,41 @@ def command_report(args: argparse.Namespace) -> int:
     return result.returncode
 
 
+def build_runner_argv(
+    *,
+    serial: str,
+    profile: TargetProfile,
+    payload_sha256: str,
+    output_dir: Path,
+    min_battery: int,
+    retain_bugreport: bool,
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(RUNNER),
+        "--serial",
+        serial,
+        "--profile-id",
+        profile.profile_id,
+        "--profile-sha256",
+        profile.manifest_sha256,
+        "--payload-sha256",
+        payload_sha256,
+        "--remote-payload",
+        REMOTE_PAYLOAD,
+        "--remote-su",
+        REMOTE_SU,
+        "--min-battery",
+        str(min_battery),
+        "--output-dir",
+        str(output_dir),
+        "--execute",
+    ]
+    if retain_bugreport:
+        command.append("--retain-bugreport")
+    return command
+
+
 def command_run(args: argparse.Namespace) -> int:
     profiles = load_profiles(PROFILES_ROOT)
     serial = select_serial(args.serial)
@@ -509,27 +559,14 @@ def command_run(args: argparse.Namespace) -> int:
     push_payload(serial, payload, digest)
 
     output = evidence_path(args.output_dir)
-    command = [
-        sys.executable,
-        str(RUNNER),
-        "--serial",
-        serial,
-        "--profile-id",
-        profile.profile_id,
-        "--profile-sha256",
-        profile.manifest_sha256,
-        "--payload-sha256",
-        digest,
-        "--remote-payload",
-        REMOTE_PAYLOAD,
-        "--remote-su",
-        REMOTE_SU,
-        "--output-dir",
-        str(output),
-        "--execute",
-    ]
-    if args.retain_bugreport:
-        command.append("--retain-bugreport")
+    command = build_runner_argv(
+        serial=serial,
+        profile=profile,
+        payload_sha256=digest,
+        output_dir=output,
+        min_battery=args.min_battery,
+        retain_bugreport=args.retain_bugreport,
+    )
     print(f"Private log: {output}")
     print("Starting guarded exploit chain; this usually takes several minutes …")
     result = subprocess.run(command, cwd=ROOT, check=False)
@@ -595,7 +632,15 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="accept the documented crash, reboot, and hard-hang risk",
     )
-    exploit.add_argument("--min-battery", type=int, default=20)
+    exploit.add_argument(
+        "--min-battery",
+        type=min_battery_value,
+        default=DEFAULT_MIN_BATTERY,
+        help=(
+            "minimum level required with external power at both preflight checks; "
+            "0 disables the power gate (default: 20)"
+        ),
+    )
     exploit.add_argument("--output-dir")
     exploit.add_argument(
         "--retain-bugreport",

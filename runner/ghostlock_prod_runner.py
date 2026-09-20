@@ -43,8 +43,11 @@ from ghostlock_bugreport_kaslr import KaslrParseError, KaslrResult, parse_bugrep
 DEFAULT_REMOTE_PAYLOAD = "/data/local/tmp/preload.so"
 DEFAULT_REMOTE_SU = "/data/local/tmp/su"
 DEFAULT_ATTEMPT_MARKER = "/data/local/tmp/.ghostlock-aipin-attempt"
+DEFAULT_MIN_BATTERY = 20
+ATTEMPT_CLAIMED_SENTINEL = "GHOSTLOCK_ATTEMPT_ALREADY_CLAIMED"
 FORBIDDEN_ADB_SUBCOMMANDS = frozenset(("root", "unroot"))
 PROFILES_ROOT = ROOT / "profiles"
+PHASE_DURATION_NAMES = frozenset(("preflight", "exploit", "verification"))
 STATE_SNAPSHOT_PREFIX = "GHOSTLOCK_STATE_V1"
 STATE_SNAPSHOT_FIELDS = (
     "boot_id_begin",
@@ -84,6 +87,45 @@ class DeviceState:
     slot: str
     abi: str
     payload_sha256: str
+
+
+class PhaseTimer:
+    """Record fixed, privacy-safe phase durations from a monotonic clock."""
+
+    def __init__(self, clock=time.monotonic) -> None:
+        self._clock = clock
+        self._started = clock()
+        self._phase: str | None = None
+        self._phase_started: float | None = None
+        self._durations: dict[str, float] = {}
+
+    def start(self, phase: str) -> None:
+        if phase not in PHASE_DURATION_NAMES:
+            raise RunnerError(f"unknown timing phase {phase!r}")
+        if self._phase is not None:
+            raise RunnerError(f"timing phase {self._phase!r} is already active")
+        self._phase = phase
+        self._phase_started = self._clock()
+
+    def finish(self) -> None:
+        if self._phase is None or self._phase_started is None:
+            return
+        finished = self._clock()
+        self._durations[self._phase] = round(
+            max(0.0, finished - self._phase_started), 3
+        )
+        self._phase = None
+        self._phase_started = None
+
+    def snapshot(self) -> dict[str, float]:
+        observed = self._clock()
+        durations = dict(self._durations)
+        if self._phase is not None and self._phase_started is not None:
+            durations[self._phase] = round(
+                max(0.0, observed - self._phase_started), 3
+            )
+        durations["total"] = round(max(0.0, observed - self._started), 3)
+        return durations
 
 
 def utc_now() -> str:
@@ -384,24 +426,92 @@ def attempt_token(state: DeviceState) -> str:
     return f"{state.boot_epoch} {state.fingerprint}"
 
 
+def attempt_lock_path(state: DeviceState, marker_path: str) -> str:
+    token_digest = hashlib.sha256(attempt_token(state).encode("utf-8")).hexdigest()
+    return f"{marker_path}.{token_digest}.lock"
+
+
 def ensure_no_same_boot_attempt(
     adb: Adb, state: DeviceState, marker_path: str
 ) -> None:
+    lock_path = shlex.quote(attempt_lock_path(state, marker_path))
+    marker = shlex.quote(marker_path)
     result = adb.shell(
-        f"cat {shlex.quote(marker_path)} 2>/dev/null", check=False
+        f"if [ -d {lock_path} ]; then "
+        f"printf '%s\\n' {shlex.quote(ATTEMPT_CLAIMED_SENTINEL)}; "
+        f"elif [ -f {marker} ]; then cat {marker}; else :; fi",
+        check=False,
     )
-    if result.stdout.strip() == attempt_token(state):
+    if result.returncode != 0:
+        raise RunnerError("cannot inspect the same-boot attempt claim")
+    observed = result.stdout.strip()
+    if observed in (ATTEMPT_CLAIMED_SENTINEL, attempt_token(state)):
         raise RunnerError(
             "this kernel boot already had an exploit attempt; reboot the Pin before retrying"
         )
 
 
-def mark_same_boot_attempt(
-    adb: Adb, state: DeviceState, marker_path: str
+def parse_battery(text: str) -> tuple[int | None, bool | None]:
+    level_match = re.search(r"(?m)^\s*level:\s*(\d+)\s*$", text)
+    level = int(level_match.group(1)) if level_match else None
+    if level is not None and not 0 <= level <= 100:
+        level = None
+    power_matches = re.findall(
+        r"(?mi)^\s*(?:AC|USB|Wireless) powered:\s*(true|false)\s*$", text
+    )
+    powered = (
+        any(value.lower() == "true" for value in power_matches)
+        if power_matches
+        else None
+    )
+    return level, powered
+
+
+def require_attempt_power(adb: Adb, min_battery: int) -> None:
+    if not 0 <= min_battery <= 100:
+        raise RunnerError("minimum battery must be between 0 and 100")
+    if min_battery == 0:
+        return
+    result = adb.shell("dumpsys battery", check=False)
+    level, powered = parse_battery(result.stdout if result.returncode == 0 else "")
+    if level is None or powered is None:
+        raise RunnerError(
+            "battery or power state is unavailable immediately before the attempt; "
+            "the same-boot attempt marker was not written"
+        )
+    if level < min_battery:
+        raise RunnerError(
+            f"battery fell to {level}%; at least {min_battery}% is required "
+            "immediately before the attempt; the same-boot attempt marker was not written"
+        )
+    if not powered:
+        raise RunnerError(
+            "external power disconnected before the attempt; "
+            "the same-boot attempt marker was not written"
+        )
+
+
+def acquire_same_boot_attempt(
+    adb: Adb,
+    state: DeviceState,
+    marker_path: str,
+    *,
+    min_battery: int,
 ) -> None:
+    require_attempt_power(adb, min_battery)
     token = shlex.quote(attempt_token(state))
-    path = shlex.quote(marker_path)
-    adb.shell(f"umask 077; printf '%s\\n' {token} > {path}")
+    marker = shlex.quote(marker_path)
+    lock_path = shlex.quote(attempt_lock_path(state, marker_path))
+    result = adb.shell(
+        f"umask 077; mkdir {lock_path} || exit 73; "
+        f"printf '%s\\n' {token} > {marker}",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RunnerError(
+            "could not atomically acquire the same-boot attempt claim; "
+            "another runner may own it, so reboot before retrying"
+        )
 
 
 def make_bugreport(adb: Adb, destination: Path, timeout: int) -> None:
@@ -523,6 +633,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--remote-payload", default=DEFAULT_REMOTE_PAYLOAD)
     parser.add_argument("--remote-su", default=DEFAULT_REMOTE_SU)
     parser.add_argument("--attempt-marker", default=DEFAULT_ATTEMPT_MARKER)
+    parser.add_argument("--min-battery", type=int, default=DEFAULT_MIN_BATTERY)
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--execute", action="store_true")
@@ -534,6 +645,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--profile-sha256 must be exactly 64 lowercase hexadecimal characters")
     if args.timeout < 60 or args.bugreport_timeout < 60:
         parser.error("timeouts must be at least 60 seconds")
+    if not 0 <= args.min_battery <= 100:
+        parser.error("--min-battery must be between 0 and 100")
     try:
         profile = profile_by_id(load_profiles(PROFILES_ROOT), args.profile_id)
     except ProfileError as exc:
@@ -575,6 +688,8 @@ def main(argv: list[str] | None = None) -> int:
         "mm_geometry": asdict(geometry),
         "output_dir": str(output_dir),
     }
+    phase_timer = PhaseTimer()
+    phase_timer.start("preflight")
 
     transient_bugreport: Path | None = None
     try:
@@ -648,6 +763,8 @@ def main(argv: list[str] | None = None) -> int:
         assert_same_boot(initial, pinned)
         manifest["pinned_state"] = asdict(pinned)
         manifest["preflight"] = "green"
+        phase_timer.finish()
+        manifest["phase_durations_seconds"] = phase_timer.snapshot()
         write_manifest(manifest_path, manifest)
         print(
             "preflight green: adbd uid=2000, shell domain, SELinux enforcing, "
@@ -658,12 +775,20 @@ def main(argv: list[str] | None = None) -> int:
         if not args.execute:
             manifest["completed_at"] = utc_now()
             manifest["result"] = "preflight-only"
+            manifest["phase_durations_seconds"] = phase_timer.snapshot()
             write_manifest(manifest_path, manifest)
             return 0
 
-        mark_same_boot_attempt(adb, pinned, args.attempt_marker)
+        phase_timer.start("exploit")
+        acquire_same_boot_attempt(
+            adb,
+            pinned,
+            args.attempt_marker,
+            min_battery=args.min_battery,
+        )
         manifest["attempt_marker"] = args.attempt_marker
         manifest["attempt_token"] = attempt_token(pinned)
+        manifest["phase_durations_seconds"] = phase_timer.snapshot()
         write_manifest(manifest_path, manifest)
 
         exploit_argv = build_exploit_argv(
@@ -680,6 +805,9 @@ def main(argv: list[str] | None = None) -> int:
             host_command, output_dir / "run.log", args.timeout
         )
         manifest["exploit_returncode"] = exploit_rc
+        phase_timer.finish()
+        phase_timer.start("verification")
+        manifest["phase_durations_seconds"] = phase_timer.snapshot()
 
         # The exploit deliberately repoints the boot_id sysctl data pointer.
         # Keep sampling both values, but bind the post-exploit snapshot to the
@@ -721,14 +849,18 @@ def main(argv: list[str] | None = None) -> int:
             )
         manifest["result"] = "root-via-production-equivalent-chain"
         manifest["completed_at"] = utc_now()
+        phase_timer.finish()
+        manifest["phase_durations_seconds"] = phase_timer.snapshot()
         write_manifest(manifest_path, manifest)
         print(acceptance.stdout.strip(), flush=True)
         print(f"evidence written to {output_dir}", flush=True)
         return 0
     except (RunnerError, KaslrParseError, OSError) as exc:
+        phase_timer.finish()
         manifest["completed_at"] = utc_now()
         manifest["result"] = "failed-closed"
         manifest["error"] = str(exc)
+        manifest["phase_durations_seconds"] = phase_timer.snapshot()
         try:
             write_manifest(manifest_path, manifest)
         except OSError:

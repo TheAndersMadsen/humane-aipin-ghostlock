@@ -21,7 +21,7 @@ Version 0.1.0 accepts one profile:
 The kernel Image hash identifies the private analysis input used to produce the
 profile. The runner cannot read the retail boot partition from an unprivileged
 ADB shell, so its live executable gates are the complete fingerprint, exact
-kernel release, kernel build marker, slot, ABI, UID, SELinux context, and
+kernel release, version and machine, slot, ABI, UID, SELinux context, and
 enforcing state.
 
 The manifest is the host source of truth. Its hash, kernel Image hash, symbols

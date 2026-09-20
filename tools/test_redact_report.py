@@ -19,6 +19,20 @@ SPEC.loader.exec_module(REDACTOR)
 
 
 class RedactionTests(unittest.TestCase):
+    def test_duration_filter_rejects_invalid_and_unlisted_values(self) -> None:
+        self.assertEqual(
+            REDACTOR.safe_phase_durations(
+                {
+                    "preflight": 10**400,
+                    "exploit": float("inf"),
+                    "verification": True,
+                    "total": -1,
+                    "private_phase": 12.5,
+                }
+            ),
+            {},
+        )
+
     def test_private_identifiers_and_addresses_are_removed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -55,6 +69,16 @@ class RedactionTests(unittest.TestCase):
                         }
                     ],
                 },
+                "phase_durations_seconds": {
+                    "preflight": 72.34567,
+                    "exploit": 533,
+                    "verification": 1.25,
+                    "total": 606.595,
+                    "private_serial_timing": "PRIVATE-SERIAL",
+                    "negative": -1,
+                    "boolean": True,
+                    "overflow": 10**400,
+                },
                 "acceptance_returncode": 0,
                 "acceptance_output": "uid=0(root) gid=0(root)",
             }
@@ -67,12 +91,12 @@ class RedactionTests(unittest.TestCase):
                 "direct-root-summary root=1 id=1 su=1/0\n"
             )
 
-            rendered = json.dumps(REDACTOR.redact(root))
+            report = REDACTOR.redact(root)
+            rendered = json.dumps(report)
             self.assertNotIn("PRIVATE-SERIAL", rendered)
             self.assertNotIn("PRIVATE-BOOT-ID", rendered)
             self.assertNotIn(private_path, rendered)
             self.assertNotIn("ffffffaa", rendered)
-            report = json.loads(rendered)
             self.assertTrue(report["acceptance_ok"])
             self.assertEqual(report["profile_id"], "humane-aipin-45.20-nov4")
             self.assertEqual(report["profile_manifest_sha256"], "b" * 64)
@@ -80,6 +104,16 @@ class RedactionTests(unittest.TestCase):
                 report["initial_state"]["kernel_release"], "4.14.190-perf"
             )
             self.assertNotIn("kernel", report["initial_state"])
+            self.assertEqual(
+                report["phase_durations_seconds"],
+                {
+                    "preflight": 72.346,
+                    "exploit": 533.0,
+                    "verification": 1.25,
+                    "total": 606.595,
+                },
+            )
+            self.assertNotIn("private_serial_timing", rendered)
 
     def test_output_write_failure_is_reported_without_a_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

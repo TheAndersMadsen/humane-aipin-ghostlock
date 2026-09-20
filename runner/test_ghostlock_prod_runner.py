@@ -31,6 +31,48 @@ class RecordingAdb:
         return subprocess.CompletedProcess((command,), 0, self.snapshot, "")
 
 
+class AttemptAdb:
+    def __init__(
+        self,
+        battery: str,
+        *,
+        battery_returncode: int = 0,
+        acquisition_returncode: int = 0,
+    ) -> None:
+        self.battery = battery
+        self.battery_returncode = battery_returncode
+        self.acquisition_returncode = acquisition_returncode
+        self.calls: list[str] = []
+
+    def shell(self, command: str, **_kwargs) -> subprocess.CompletedProcess[str]:
+        self.calls.append(command)
+        if command == "dumpsys battery":
+            return subprocess.CompletedProcess(
+                (command,), self.battery_returncode, self.battery, ""
+            )
+        return subprocess.CompletedProcess(
+            (command,), self.acquisition_returncode, "", ""
+        )
+
+
+class SharedClaimAdb:
+    def __init__(self) -> None:
+        self.claimed = False
+        self.calls: list[str] = []
+
+    def shell(self, command: str, **_kwargs) -> subprocess.CompletedProcess[str]:
+        self.calls.append(command)
+        if command == "dumpsys battery":
+            return subprocess.CompletedProcess(
+                (command,), 0, "USB powered: true\nlevel: 100\n", ""
+            )
+        if "mkdir" in command:
+            if self.claimed:
+                return subprocess.CompletedProcess((command,), 73, "", "")
+            self.claimed = True
+        return subprocess.CompletedProcess((command,), 0, "", "")
+
+
 class ProdRunnerTest(unittest.TestCase):
     PAYLOAD_SHA256 = "a" * 64
     PROFILES = RUNNER.load_profiles(RUNNER.PROFILES_ROOT)
@@ -199,6 +241,142 @@ class ProdRunnerTest(unittest.TestCase):
                 with self.assertRaisesRegex(RUNNER.RunnerError, error):
                     RUNNER.capture_state(adb, "/data/local/tmp/preload.so")
 
+    def test_attempt_claim_rechecks_power_immediately_before_atomic_write(self) -> None:
+        adb = AttemptAdb(
+            "AC powered: false\nUSB powered: true\n"
+            "Wireless powered: false\nlevel: 67\n"
+        )
+
+        RUNNER.acquire_same_boot_attempt(
+            adb,
+            self.state(),
+            RUNNER.DEFAULT_ATTEMPT_MARKER,
+            min_battery=20,
+        )
+
+        self.assertEqual(adb.calls[0], "dumpsys battery")
+        self.assertLess(adb.calls[1].index("mkdir"), adb.calls[1].index("printf"))
+        self.assertEqual(len(adb.calls), 2)
+
+    def test_attempt_claim_is_not_consumed_when_power_gate_fails(self) -> None:
+        cases = (
+            ("status: 2\n", 0, "unavailable"),
+            ("USB powered: true\nlevel: 101\n", 0, "unavailable"),
+            ("USB powered: true\nlevel: 19\n", 0, "fell to 19%"),
+            ("USB powered: false\nlevel: 80\n", 0, "disconnected"),
+            ("USB powered: true\nlevel: 80\n", 1, "unavailable"),
+        )
+        for battery, returncode, error in cases:
+            with self.subTest(error=error, returncode=returncode):
+                adb = AttemptAdb(battery, battery_returncode=returncode)
+                with self.assertRaisesRegex(RUNNER.RunnerError, error):
+                    RUNNER.acquire_same_boot_attempt(
+                        adb,
+                        self.state(),
+                        RUNNER.DEFAULT_ATTEMPT_MARKER,
+                        min_battery=20,
+                    )
+                self.assertEqual(adb.calls, ["dumpsys battery"])
+
+    def test_zero_minimum_skips_power_gate_without_skipping_marker(self) -> None:
+        adb = AttemptAdb("unavailable")
+
+        RUNNER.acquire_same_boot_attempt(
+            adb,
+            self.state(),
+            RUNNER.DEFAULT_ATTEMPT_MARKER,
+            min_battery=0,
+        )
+
+        self.assertEqual(len(adb.calls), 1)
+        self.assertLess(adb.calls[0].index("mkdir"), adb.calls[0].index("printf"))
+
+    def test_failed_atomic_acquisition_stops_the_attempt(self) -> None:
+        adb = AttemptAdb(
+            "USB powered: true\nlevel: 100\n",
+            acquisition_returncode=73,
+        )
+
+        with self.assertRaisesRegex(RUNNER.RunnerError, "atomically acquire"):
+            RUNNER.acquire_same_boot_attempt(
+                adb,
+                self.state(),
+                RUNNER.DEFAULT_ATTEMPT_MARKER,
+                min_battery=20,
+            )
+
+        self.assertEqual(adb.calls[0], "dumpsys battery")
+        self.assertEqual(sum("mkdir" in command for command in adb.calls), 1)
+
+    def test_atomic_claim_allows_only_one_same_boot_runner(self) -> None:
+        adb = SharedClaimAdb()
+
+        RUNNER.acquire_same_boot_attempt(
+            adb,
+            self.state(),
+            RUNNER.DEFAULT_ATTEMPT_MARKER,
+            min_battery=20,
+        )
+        with self.assertRaisesRegex(RUNNER.RunnerError, "another runner"):
+            RUNNER.acquire_same_boot_attempt(
+                adb,
+                self.state(),
+                RUNNER.DEFAULT_ATTEMPT_MARKER,
+                min_battery=20,
+            )
+
+        self.assertEqual(sum("mkdir" in command for command in adb.calls), 2)
+
+    def test_attempt_claim_is_stable_per_boot_and_changes_after_reboot(self) -> None:
+        initial = RUNNER.attempt_lock_path(
+            self.state(), RUNNER.DEFAULT_ATTEMPT_MARKER
+        )
+        same_boot = RUNNER.attempt_lock_path(
+            self.state(uptime_seconds=2000.0), RUNNER.DEFAULT_ATTEMPT_MARKER
+        )
+        next_boot = RUNNER.attempt_lock_path(
+            self.state(boot_epoch="1700000001"), RUNNER.DEFAULT_ATTEMPT_MARKER
+        )
+
+        self.assertEqual(initial, same_boot)
+        self.assertNotEqual(initial, next_boot)
+        self.assertTrue(initial.endswith(".lock"))
+
+    def test_preflight_rejects_an_existing_atomic_claim(self) -> None:
+        adb = RecordingAdb(RUNNER.ATTEMPT_CLAIMED_SENTINEL + "\n")
+
+        with self.assertRaisesRegex(RUNNER.RunnerError, "already had"):
+            RUNNER.ensure_no_same_boot_attempt(
+                adb, self.state(), RUNNER.DEFAULT_ATTEMPT_MARKER
+            )
+
+        command = adb.calls[0][1][0]
+        self.assertIn("[ -d", command)
+        self.assertIn(
+            RUNNER.attempt_lock_path(self.state(), RUNNER.DEFAULT_ATTEMPT_MARKER),
+            command,
+        )
+
+    def test_phase_timer_records_only_fixed_monotonic_durations(self) -> None:
+        observed = iter((100.0, 100.0, 105.4321, 106.0, 110.0, 112.0, 113.0))
+        timer = RUNNER.PhaseTimer(clock=lambda: next(observed))
+
+        timer.start("preflight")
+        timer.finish()
+        timer.start("exploit")
+        active = timer.snapshot()
+        timer.finish()
+        complete = timer.snapshot()
+
+        self.assertEqual(active["preflight"], 5.432)
+        self.assertEqual(active["exploit"], 4.0)
+        self.assertEqual(active["total"], 10.0)
+        self.assertEqual(complete["exploit"], 6.0)
+        self.assertEqual(complete["total"], 13.0)
+        self.assertEqual(
+            set(complete), {"preflight", "exploit", "total"}
+        )
+
     def test_uid_zero_is_rejected(self) -> None:
         with self.assertRaises(RUNNER.RunnerError):
             self.assert_valid(self.state(uid="0", context="u:r:su:s0"))
@@ -340,6 +518,25 @@ class ProdRunnerTest(unittest.TestCase):
                         "0" * 64,
                         "--payload-sha256",
                         self.PAYLOAD_SHA256,
+                    ]
+                )
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_direct_runner_rejects_out_of_range_minimum_battery(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                RUNNER.main(
+                    [
+                        "--serial",
+                        "SERIAL",
+                        "--profile-id",
+                        self.PROFILE.profile_id,
+                        "--profile-sha256",
+                        self.PROFILE.manifest_sha256,
+                        "--payload-sha256",
+                        self.PAYLOAD_SHA256,
+                        "--min-battery",
+                        "101",
                     ]
                 )
         self.assertEqual(raised.exception.code, 2)

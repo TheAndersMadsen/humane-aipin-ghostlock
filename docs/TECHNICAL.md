@@ -24,8 +24,11 @@ native gate from that manifest and embeds the manifest, Image, and symbols
 hashes in the payload. The runner rejects any payload/profile drift.
 
 The payload independently verifies the fingerprint, exact kernel release,
-version and machine, active slot, ABI, shell UID, SELinux domain, and enforcing state.
-The host runner checks the same boundary before and after bugreport capture.
+version and machine, active slot, ABI, shell UID, SELinux domain, and enforcing
+state. The host runner checks the same boundary before and after bugreport
+capture. Immediately before writing the one-attempt marker, it also rechecks
+the configured minimum battery level and external power state, then acquires
+the boot-specific attempt claim with an atomic directory creation.
 
 ### 2. Boot-bound KASLR derivation
 
@@ -89,6 +92,7 @@ and versioned.
 - same-PFN free/allocation proof before corruption;
 - supervised single-use write children;
 - independent fresh-shell root verification;
+- privacy-safe monotonic phase durations for failure comparison;
 - no persistence, partition write, module load, or network request.
 
 ## Limits

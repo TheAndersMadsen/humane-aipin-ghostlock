@@ -24,7 +24,9 @@ Generate a reduced JSON report:
 ```
 
 The redactor includes target compatibility fields, high-level gate results,
-anchor symbol names, and success booleans. It omits:
+anchor symbol names, success booleans, and fixed monotonic durations for the
+preflight, exploit, verification, and total run. Arbitrary timing keys from a
+private manifest are not copied. It omits:
 
 - device serial and boot identity;
 - absolute host paths;
