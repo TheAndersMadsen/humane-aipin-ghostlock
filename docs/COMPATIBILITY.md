@@ -11,7 +11,7 @@ Version 0.1.0 accepts one profile:
 | Kernel release | `Linux version 4.14.190-perf` |
 | Kernel build marker | `Mon Nov 4 18:37:23 PST 2024` |
 | Active slot | `_b` |
-| ABI | `aarch64` |
+| CPU ABI property (`ro.product.cpu.abi`) | `arm64-v8a` |
 | Kernel Image SHA-256 | `d4f4e0deb20871fce207f1f095ba1934162081c2f10afaccbb2e6a1e938719fb` |
 
 The kernel Image hash identifies the private analysis input used to produce the
