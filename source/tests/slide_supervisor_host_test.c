@@ -73,7 +73,7 @@ static int write_all(int fd, const void *buffer, size_t size) {
   return 0;
 }
 
-static void hang_forever(void) {
+static _Noreturn void hang_forever(void) {
   for (;;) {
     pause();
   }
