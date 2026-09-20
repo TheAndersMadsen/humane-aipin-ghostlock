@@ -26,12 +26,20 @@ class RedactionTests(unittest.TestCase):
             manifest = {
                 "result": "root-via-production-equivalent-chain",
                 "mode": "execute",
+                "profile_id": "humane-aipin-45.20-nov4",
+                "profile_sha256": "b" * 64,
+                "kernel_image_sha256": "c" * 64,
+                "symbols_sha256": "d" * 64,
                 "serial": "PRIVATE-SERIAL",
                 "output_dir": private_path,
                 "initial_state": {
                     "serial": "PRIVATE-SERIAL",
                     "boot_id": "PRIVATE-BOOT-ID",
                     "fingerprint": "public-fingerprint",
+                    "kernel": (
+                        "Linux PRIVATE-SERIAL 4.14.190-perf #1 SMP PREEMPT"
+                    ),
+                    "kernel_release": "4.14.190-perf",
                     "slot": "_b",
                     "uid": "2000",
                     "context": "u:r:shell:s0",
@@ -64,7 +72,14 @@ class RedactionTests(unittest.TestCase):
             self.assertNotIn("PRIVATE-BOOT-ID", rendered)
             self.assertNotIn(private_path, rendered)
             self.assertNotIn("ffffffaa", rendered)
-            self.assertTrue(json.loads(rendered)["acceptance_ok"])
+            report = json.loads(rendered)
+            self.assertTrue(report["acceptance_ok"])
+            self.assertEqual(report["profile_id"], "humane-aipin-45.20-nov4")
+            self.assertEqual(report["profile_manifest_sha256"], "b" * 64)
+            self.assertEqual(
+                report["initial_state"]["kernel_release"], "4.14.190-perf"
+            )
+            self.assertNotIn("kernel", report["initial_state"])
 
     def test_output_write_failure_is_reported_without_a_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

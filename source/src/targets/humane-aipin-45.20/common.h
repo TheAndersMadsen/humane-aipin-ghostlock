@@ -32,6 +32,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>

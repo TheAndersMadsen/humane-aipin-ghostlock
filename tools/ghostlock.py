@@ -26,12 +26,14 @@ from ghostlock_profile import (  # noqa: E402
     matching_profile,
     nearest_profile,
     profile_by_id,
+    public_kernel_identity,
 )
 
 
 SOURCE = ROOT / "source"
 PROFILES_ROOT = ROOT / "profiles"
 PINNED_NDK_VERSION = "28.2.13676358"
+NDK_TARGET_COMPILER = "aarch64-linux-android35-clang"
 RUNNER = ROOT / "runner/ghostlock_prod_runner.py"
 REDACTOR = ROOT / "tools/redact_report.py"
 REMOTE_PAYLOAD = "/data/local/tmp/ghostlock-aipin.so"
@@ -96,7 +98,11 @@ def run(
 
 
 def adb(serial: str, *args: str, timeout: int = 30, check: bool = True):
-    return run(["adb", "-s", serial, *args], timeout=timeout, check=check)
+    try:
+        return run(["adb", "-s", serial, *args], timeout=timeout, check=check)
+    except GhostLockError as exc:
+        message = str(exc).replace(serial, "<serial>") if serial else "ADB command failed"
+        raise GhostLockError(message) from exc
 
 
 def shell(serial: str, command: str, *, timeout: int = 30, check: bool = True):
@@ -112,31 +118,56 @@ def require_command(name: str) -> None:
         raise GhostLockError(f"required command is missing: {name}")
 
 
-def connected_devices() -> list[str]:
+def adb_device_inventory() -> list[tuple[str, str]]:
     require_command("adb")
-    result = run(["adb", "devices"])
-    devices: list[str] = []
-    for line in result.stdout.replace("\r", "").splitlines()[1:]:
+    try:
+        result = run(["adb", "devices"])
+    except GhostLockError as exc:
+        raise GhostLockError("cannot query ADB device states") from exc
+    devices: list[tuple[str, str]] = []
+    reading_devices = False
+    for line in result.stdout.replace("\r", "").splitlines():
+        if line.startswith("List of devices attached"):
+            reading_devices = True
+            continue
+        if not reading_devices:
+            continue
         fields = line.split()
-        if len(fields) >= 2 and fields[1] == "device":
-            devices.append(fields[0])
+        if len(fields) >= 2:
+            devices.append((fields[0], fields[1]))
     return devices
 
 
+def mask_serial(_serial: str) -> str:
+    return "<redacted>"
+
+
+def inventory_summary(inventory: list[tuple[str, str]]) -> str:
+    states = [state for _serial, state in inventory]
+    ready = states.count("device")
+    unauthorized = states.count("unauthorized")
+    offline = states.count("offline")
+    other = len(states) - ready - unauthorized - offline
+    return (
+        f"ready={ready}, unauthorized={unauthorized}, "
+        f"offline={offline}, other={other}"
+    )
+
+
 def select_serial(requested: str | None) -> str:
-    devices = connected_devices()
+    inventory = adb_device_inventory()
+    devices = [serial for serial, state in inventory if state == "device"]
     if requested:
         if requested not in devices:
-            found = ", ".join(devices) or "none"
             raise GhostLockError(
-                f"device {requested!r} is not ready; connected devices: {found}"
+                f"device {mask_serial(requested)!r} is not ready; "
+                f"ADB states: {inventory_summary(inventory)}"
             )
         return requested
     if len(devices) != 1:
-        found = ", ".join(devices) or "none"
         raise GhostLockError(
             "connect exactly one authorized AI Pin or pass --serial; "
-            f"ready devices: {found}"
+            f"ADB states: {inventory_summary(inventory)}"
         )
     return devices[0]
 
@@ -197,12 +228,15 @@ def print_device(
     info: DeviceInfo,
     profile: TargetProfile | None,
     mismatches: tuple[str, ...],
+    *,
+    reveal_serial: bool = False,
 ) -> None:
     battery = "unknown" if info.battery_level is None else f"{info.battery_level}%"
     power = "unknown" if info.powered is None else ("connected" if info.powered else "not connected")
-    print(f"Device:      {info.serial}")
+    serial = info.serial if reveal_serial else mask_serial(info.serial)
+    print(f"Device:      {serial}")
     print(f"Firmware:    {info.fingerprint}")
-    print(f"Kernel:      {info.kernel}")
+    print(f"Kernel:      {public_kernel_identity(info.kernel)}")
     print(f"Release:     {info.kernel_release}")
     print(f"Slot:        {info.slot}")
     print(f"ABI:         {info.abi}")
@@ -212,6 +246,19 @@ def print_device(
     print(f"Profile:     {profile.profile_id if profile else 'UNSUPPORTED'}")
     for mismatch in mismatches:
         print(f"Mismatch:    {mismatch}")
+
+
+def ndk_compiler_path(ndk: Path) -> Path:
+    host_tag = "darwin-x86_64" if sys.platform == "darwin" else "linux-x86_64"
+    return (
+        ndk
+        / "toolchains"
+        / "llvm"
+        / "prebuilt"
+        / host_tag
+        / "bin"
+        / NDK_TARGET_COMPILER
+    )
 
 
 def find_ndk(explicit: str | None) -> Path | None:
@@ -224,6 +271,11 @@ def find_ndk(explicit: str | None) -> Path | None:
     ):
         if value:
             candidates.append(Path(value).expanduser())
+    for variable in ("ANDROID_SDK_ROOT", "ANDROID_HOME"):
+        if sdk_root := os.environ.get(variable):
+            candidates.append(
+                Path(sdk_root).expanduser() / "ndk" / PINNED_NDK_VERSION
+            )
     candidates.extend(
         (
             Path.home() / "Library/Android/sdk/ndk" / PINNED_NDK_VERSION,
@@ -232,7 +284,8 @@ def find_ndk(explicit: str | None) -> Path | None:
     )
     for candidate in candidates:
         properties = candidate / "source.properties"
-        if not (candidate / "toolchains/llvm/prebuilt").is_dir():
+        compiler = ndk_compiler_path(candidate)
+        if not compiler.is_file() or not os.access(compiler, os.X_OK):
             continue
         try:
             metadata = properties.read_text(encoding="utf-8")
@@ -385,16 +438,26 @@ def command_check(args: argparse.Namespace) -> int:
     profile, mismatches = evaluate_device(info, profiles)
     print_device(info, profile, mismatches)
     ndk = find_ndk(args.ndk)
+    make = shutil.which("make")
     print(
         f"Android NDK: {ndk if ndk else f'{PINNED_NDK_VERSION} not found'}"
     )
+    print(f"Make:        {make if make else 'not found'}")
     if profile is None:
         return 2
     if not info.clean_shell:
         print("Status:      supported, but this boot is not clean for a new exploit run")
         return 1
+    missing = []
     if ndk is None:
-        print("Status:      device supported, but the pinned Android NDK is missing")
+        missing.append(f"Android NDK {PINNED_NDK_VERSION}")
+    if make is None:
+        missing.append("make")
+    if missing:
+        print(
+            "Status:      device supported, but host prerequisites are missing: "
+            + ", ".join(missing)
+        )
         return 1
     print("Status:      ready for a guarded run")
     return 0
@@ -433,7 +496,7 @@ def command_run(args: argparse.Namespace) -> int:
     serial = select_serial(args.serial)
     info = inspect_device(serial)
     selected, mismatches = evaluate_device(info, profiles)
-    print_device(info, selected, mismatches)
+    print_device(info, selected, mismatches, reveal_serial=True)
     profile = require_target(info, profiles, min_battery=args.min_battery)
     confirm_risk(info, args.yes)
 
@@ -512,7 +575,7 @@ def parser() -> argparse.ArgumentParser:
     verify.set_defaults(handler=command_verify)
 
     report = sub.add_parser(
-        "report", help="create an issue-safe report from a private run directory"
+        "report", help="create a reduced report for manual review"
     )
     report.add_argument("private_run", type=Path)
     report.add_argument("--output", type=Path)

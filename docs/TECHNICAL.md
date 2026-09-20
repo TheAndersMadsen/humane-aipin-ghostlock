@@ -18,9 +18,14 @@ The stable kernel fix is available from
 
 ### 1. Runtime target gate
 
-The payload independently verifies the fingerprint, kernel release and build
-marker, active slot, shell UID, SELinux domain, and enforcing state. The host
-runner checks the same boundary before and after bugreport capture.
+One strict profile manifest binds the Image hash, minimal symbols, exact live
+identity, accepted placements, and allocator geometry. The build generates the
+native gate from that manifest and embeds the manifest, Image, and symbols
+hashes in the payload. The runner rejects any payload/profile drift.
+
+The payload independently verifies the fingerprint, exact kernel release,
+version and machine, active slot, ABI, shell UID, SELinux domain, and enforcing state.
+The host runner checks the same boundary before and after bugreport capture.
 
 ### 2. Boot-bound KASLR derivation
 

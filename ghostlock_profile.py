@@ -12,7 +12,7 @@ from typing import Any
 
 
 PROFILE_FILENAME = "profile.json"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 IDENTIFIER_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
 SLOT_RE = re.compile(r"_[ab]")
@@ -20,6 +20,14 @@ SLOT_RE = re.compile(r"_[ab]")
 
 class ProfileError(RuntimeError):
     """A profile is missing, malformed, ambiguous, or no longer hash-bound."""
+
+
+def public_kernel_identity(kernel: str) -> str:
+    """Remove the uname nodename while retaining compatibility fields."""
+    fields = kernel.split(maxsplit=2)
+    if len(fields) != 3 or fields[0] != "Linux":
+        return "<unparseable uname>"
+    return f"Linux <nodename> {fields[2]}"
 
 
 @dataclass(frozen=True)
@@ -54,6 +62,7 @@ class TargetProfile:
     fingerprint: str
     kernel_release: str
     kernel_build_marker: str
+    kernel_machine: str
     kernel_image_sha256: str
     accepted_slots: tuple[str, ...]
     accepted_abis: tuple[str, ...]
@@ -89,10 +98,20 @@ class TargetProfile:
                 "kernel release: "
                 f"expected {self.kernel_release!r}, observed {kernel_release!r}"
             )
-        if self.kernel_build_marker not in kernel:
+        expected_kernel = re.compile(
+            r"Linux \S+ "
+            + re.escape(self.kernel_release)
+            + " "
+            + re.escape(self.kernel_build_marker)
+            + " "
+            + re.escape(self.kernel_machine)
+        )
+        if expected_kernel.fullmatch(kernel) is None:
             mismatches.append(
-                "kernel build: "
-                f"required marker {self.kernel_build_marker!r}, observed {kernel!r}"
+                "kernel identity: expected exact release/version/machine "
+                f"{self.kernel_release!r}/{self.kernel_build_marker!r}/"
+                f"{self.kernel_machine!r}, observed "
+                f"{public_kernel_identity(kernel)!r}"
             )
         if slot not in self.accepted_slots:
             mismatches.append(
@@ -210,6 +229,7 @@ def load_profile(path: Path) -> TargetProfile:
         "fingerprint",
         "kernel_release",
         "kernel_build_marker",
+        "kernel_machine",
         "kernel_image_sha256",
         "accepted_slots",
         "accepted_abis",
@@ -273,6 +293,7 @@ def load_profile(path: Path) -> TargetProfile:
         kernel_build_marker=_require_text(
             data["kernel_build_marker"], "kernel_build_marker"
         ),
+        kernel_machine=_require_text(data["kernel_machine"], "kernel_machine"),
         kernel_image_sha256=_require_sha256(
             data["kernel_image_sha256"], "kernel_image_sha256"
         ),
@@ -312,6 +333,7 @@ def load_profiles(root: Path) -> tuple[TargetProfile, ...]:
                 left.fingerprint == right.fingerprint
                 and left.kernel_release == right.kernel_release
                 and left.kernel_build_marker == right.kernel_build_marker
+                and left.kernel_machine == right.kernel_machine
             )
             if (
                 same_kernel_identity

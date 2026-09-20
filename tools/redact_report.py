@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create an issue-safe GhostLock report from a private run directory."""
+"""Create a reduced GhostLock report for manual review before sharing."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def safe_state(value: object) -> dict[str, object] | None:
         "context",
         "selinux",
         "fingerprint",
-        "kernel",
+        "kernel_release",
         "slot",
         "abi",
         "payload_sha256",
@@ -81,6 +81,10 @@ def redact(path: Path) -> dict[str, object]:
         "tool": "ghostlock-aipin",
         "result": manifest.get("result", "unknown"),
         "mode": manifest.get("mode", "unknown"),
+        "profile_id": manifest.get("profile_id"),
+        "profile_manifest_sha256": manifest.get("profile_sha256"),
+        "kernel_image_sha256": manifest.get("kernel_image_sha256"),
+        "symbols_sha256": manifest.get("symbols_sha256"),
         "started_at": manifest.get("started_at"),
         "completed_at": manifest.get("completed_at"),
         "initial_state": safe_state(manifest.get("initial_state")),

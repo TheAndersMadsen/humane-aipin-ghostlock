@@ -46,51 +46,15 @@ NDK_ROOT ?= $(or $(ANDROID_NDK_HOME),$(ANDROID_NDK_ROOT),$(wildcard $(DARWIN_NDK
 NDK_PREBUILT := $(if $(filter Darwin,$(shell uname -s)),darwin-x86_64,linux-x86_64)
 NDK_TOOLCHAIN ?= $(if $(NDK_ROOT),$(NDK_ROOT)/toolchains/llvm/prebuilt/$(NDK_PREBUILT))
 NDK_CC := $(NDK_TOOLCHAIN)/bin/aarch64-linux-android$(API)-clang
-HOST_CLANG ?= clang
 HOST_CC ?= cc
 SHA256 ?= $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo "shasum -a 256")
-SYSROOT ?= $(if $(NDK_TOOLCHAIN),$(NDK_TOOLCHAIN)/sysroot)
-RESOURCE_DIR ?= $(if $(NDK_TOOLCHAIN),$(NDK_TOOLCHAIN)/lib/clang/21)
 
-HOST_TARGET_FLAGS := \
-  --target=aarch64-linux-android$(API) \
-  --sysroot=$(SYSROOT) \
-  -resource-dir $(RESOURCE_DIR) \
-  --rtlib=compiler-rt \
-  --unwindlib=none
-HOST_COMMON_LDFLAGS := \
-  -fuse-ld=lld \
-  -Wl,-rpath-link,$(SYSROOT)/usr/lib/aarch64-linux-android/$(API) \
-  -L$(SYSROOT)/usr/lib/aarch64-linux-android/$(API) \
-  -L$(SYSROOT)/usr/lib/aarch64-linux-android
-HOST_PIE_LDFLAGS := \
-  $(HOST_COMMON_LDFLAGS) \
-  -Wl,-dynamic-linker,/system/bin/linker64
-
-ifneq ($(origin CC),default)
-  TARGET_CC := $(CC)
-  TARGET_FLAGS :=
-  TARGET_COMMON_LDFLAGS :=
-  TARGET_PIE_LDFLAGS :=
-else ifneq ($(wildcard $(NDK_CC)),)
-  NDK_CC_WORKS := $(shell $(NDK_CC) --version >/dev/null 2>&1 && echo yes)
-  ifeq ($(NDK_CC_WORKS),yes)
-    TARGET_CC := $(NDK_CC)
-    TARGET_FLAGS :=
-    TARGET_COMMON_LDFLAGS :=
-    TARGET_PIE_LDFLAGS :=
-  else
-    TARGET_CC := $(HOST_CLANG)
-    TARGET_FLAGS := $(HOST_TARGET_FLAGS)
-    TARGET_COMMON_LDFLAGS := $(HOST_COMMON_LDFLAGS)
-    TARGET_PIE_LDFLAGS := $(HOST_PIE_LDFLAGS)
-  endif
-else
-  TARGET_CC := $(HOST_CLANG)
-  TARGET_FLAGS := $(HOST_TARGET_FLAGS)
-  TARGET_COMMON_LDFLAGS := $(HOST_COMMON_LDFLAGS)
-  TARGET_PIE_LDFLAGS := $(HOST_PIE_LDFLAGS)
-endif
+# Android artifacts always use the compiler wrapper from the pinned NDK.
+# Generic CC/HOST_CC settings are intentionally limited to host regressions.
+TARGET_CC := $(NDK_CC)
+TARGET_FLAGS :=
+TARGET_COMMON_LDFLAGS :=
+TARGET_PIE_LDFLAGS :=
 
 COMMON_CFLAGS := -O2 -g0 -Wall -Wextra -Isrc
 PIE_CFLAGS := -fPIE -pie $(COMMON_CFLAGS)
@@ -126,7 +90,7 @@ $(EMBED_SU): $(call pick_src,su_daemon.c) $(PROFILE_HEADER) | $(EMBEDDIR)
 	$(TARGET_CC) $(TARGET_FLAGS) $(PIE_CFLAGS) $(TARGET_CFLAGS) \
 	  $< $(TARGET_PIE_LDFLAGS) -o $@
 
-$(PRELOAD): $(PRELOAD_SRCS) $(EMBED_SU) $(TARGET_SUPPORT_FILES) $(PROFILE_HEADER) src/offset.h src/kernelsnitch/*.h | $(OUTDIR)
+$(PRELOAD): $(PRELOAD_SRCS) $(EMBED_SU) $(TARGET_SUPPORT_FILES) $(PROFILE_HEADER) src/offset.h src/profile_geometry.h src/kernelsnitch/*.h | $(OUTDIR)
 	$(TARGET_CC) $(TARGET_FLAGS) $(SO_CFLAGS) $(WARN_CFLAGS) $(TARGET_CFLAGS) \
 	  $(PRELOAD_SRCS) $(TARGET_COMMON_LDFLAGS) \
 	  -shared -o $@ -pthread
@@ -135,7 +99,7 @@ $(PRELOAD): $(PRELOAD_SRCS) $(EMBED_SU) $(TARGET_SUPPORT_FILES) $(PROFILE_HEADER
 build/tests:
 	mkdir -p $@
 
-build/tests/perf_reclaim_gate_test: tests/perf_reclaim_gate_test.c src/perf_reclaim_math.c src/perf_reclaim_gate.h $(PROFILE_HEADER) | build/tests
+build/tests/perf_reclaim_gate_test: tests/perf_reclaim_gate_test.c src/perf_reclaim_math.c src/perf_reclaim_gate.h src/profile_geometry.h $(PROFILE_HEADER) | build/tests
 	$(HOST_CC) -std=c11 -O2 -Wall -Wextra -Werror -Isrc $(TARGET_CFLAGS) tests/perf_reclaim_gate_test.c src/perf_reclaim_math.c -o $@
 
 build/tests/reclaim_hold_test: tests/reclaim_hold_test.c src/reclaim_hold.c src/reclaim_hold.h | build/tests

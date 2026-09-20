@@ -1,4 +1,5 @@
 #include "perf_reclaim_gate.h"
+#include "profile_geometry.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -32,8 +33,30 @@ static void test_rejections_and_capacity(void) {
              candidates, 2) == 3);
 }
 
+static void test_profile_geometry_binding(void) {
+  assert(ghostlock_profile_mm_geometry_matches(
+      PROFILE_MM_OBJECT_SIZE, PROFILE_MM_SLAB_SIZE, PROFILE_MM_ORDER,
+      PROFILE_MM_OBJECTS_PER_SLAB, PROFILE_MM_CPU_PARTIAL));
+  assert(!ghostlock_profile_mm_geometry_matches(
+      PROFILE_MM_OBJECT_SIZE + 1, PROFILE_MM_SLAB_SIZE, PROFILE_MM_ORDER,
+      PROFILE_MM_OBJECTS_PER_SLAB, PROFILE_MM_CPU_PARTIAL));
+  assert(!ghostlock_profile_mm_geometry_matches(
+      PROFILE_MM_OBJECT_SIZE, PROFILE_MM_SLAB_SIZE + 1, PROFILE_MM_ORDER,
+      PROFILE_MM_OBJECTS_PER_SLAB, PROFILE_MM_CPU_PARTIAL));
+  assert(!ghostlock_profile_mm_geometry_matches(
+      PROFILE_MM_OBJECT_SIZE, PROFILE_MM_SLAB_SIZE, PROFILE_MM_ORDER + 1,
+      PROFILE_MM_OBJECTS_PER_SLAB, PROFILE_MM_CPU_PARTIAL));
+  assert(!ghostlock_profile_mm_geometry_matches(
+      PROFILE_MM_OBJECT_SIZE, PROFILE_MM_SLAB_SIZE, PROFILE_MM_ORDER,
+      PROFILE_MM_OBJECTS_PER_SLAB + 1, PROFILE_MM_CPU_PARTIAL));
+  assert(!ghostlock_profile_mm_geometry_matches(
+      PROFILE_MM_OBJECT_SIZE, PROFILE_MM_SLAB_SIZE, PROFILE_MM_ORDER,
+      PROFILE_MM_OBJECTS_PER_SLAB, PROFILE_MM_CPU_PARTIAL + 1));
+}
+
 int main(void) {
   test_candidate_derivation();
   test_rejections_and_capacity();
+  test_profile_geometry_binding();
   return 0;
 }

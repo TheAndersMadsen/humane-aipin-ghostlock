@@ -11,7 +11,8 @@ Before opening a pull request:
 For target-profile changes, include the exact public build identifiers, kernel
 Image SHA-256, minimal consumed symbols, allocator geometry, and an honest
 clean-boot attempt denominator. Do not submit guessed offsets or family-wide
-compatibility claims.
+compatibility claims. Follow the profile sequence and unique-project rules in
+`docs/COMPATIBILITY.md`.
 
 Never commit firmware, eMMC data, boot images, full symbol tables, bugreports,
 run logs, ADB keys, device serials, account data, or live addresses. Generate a

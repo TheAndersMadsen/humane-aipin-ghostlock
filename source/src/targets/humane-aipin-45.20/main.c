@@ -56,32 +56,31 @@ static int verify_live_target(void) {
   char fingerprint[PROP_VALUE_MAX];
   char slot[PROP_VALUE_MAX];
   char abi[PROP_VALUE_MAX];
-  char release[128];
-  char version[512];
   char context[128];
   char enforcing[16];
+  struct utsname uts = {0};
 
   get_property("ro.build.fingerprint", fingerprint);
   get_property("ro.boot.slot_suffix", slot);
   get_property("ro.product.cpu.abi", abi);
-  read_first_line("/proc/sys/kernel/osrelease", release, sizeof(release));
-  read_first_line("/proc/version", version, sizeof(version));
   read_first_line("/proc/self/attr/current", context, sizeof(context));
   read_first_line("/sys/fs/selinux/enforce", enforcing, sizeof(enforcing));
 
-  int valid = strcmp(fingerprint, BUILD_FINGERPRINT) == 0 &&
+  int valid = uname(&uts) == 0 &&
+              strcmp(fingerprint, BUILD_FINGERPRINT) == 0 &&
               string_in_profile(slot, accepted_slots, BUILD_SLOT_COUNT) &&
               string_in_profile(abi, accepted_abis, BUILD_ABI_COUNT) &&
-              strcmp(release, TARGET_KERNEL_RELEASE) == 0 &&
-              strstr(version, TARGET_KERNEL_BUILD_MARKER) != NULL &&
+              strcmp(uts.release, TARGET_KERNEL_RELEASE) == 0 &&
+              strcmp(uts.version, TARGET_KERNEL_BUILD_MARKER) == 0 &&
+              strcmp(uts.machine, TARGET_KERNEL_MACHINE) == 0 &&
               getuid() == 2000 && geteuid() == 2000 &&
               strcmp(context, "u:r:shell:s0") == 0 &&
               strcmp(enforcing, "1") == 0;
   if (!valid) {
     pr_warning("target gate rejected fingerprint=%s slot=%s abi=%s release=%s "
-               "uid=%u/%u context=%s enforcing=%s version=%s\n",
-               fingerprint, slot, abi, release, getuid(), geteuid(), context,
-               enforcing, version);
+               "version=%s machine=%s uid=%u/%u context=%s enforcing=%s\n",
+               fingerprint, slot, abi, uts.release, uts.version, uts.machine,
+               getuid(), geteuid(), context, enforcing);
     return 0;
   }
 

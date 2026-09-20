@@ -26,7 +26,8 @@ anything. A mismatch stops the run.
 | Slot | `_b` only |
 | Kernel architecture | `aarch64` |
 | Android ABI | `arm64-v8a` |
-| Profile | `humane-aipin-45.20` |
+| Profile ID | `humane-aipin-45.20-nov4` |
+| Build project | `humane-aipin-45.20` |
 | Kernel Image SHA-256 | `d4f4e0deb20871fce207f1f095ba1934162081c2f10afaccbb2e6a1e938719fb` |
 | Release-candidate replay | Pending final clean-boot replay |
 
@@ -35,6 +36,12 @@ Slot `_a`, developer firmware, nearby firmware versions, and other Qualcomm
 A matching Android fingerprint is not enough to bypass this check: A/B slots
 can carry different boot images and kernel layouts under the same userspace
 build identity.
+
+Compatibility is defined by a versioned manifest under `profiles/`. The host
+launcher, runner, generated native preflight, allocator geometry, minimal
+symbols, and built payload are bound to that same manifest. Adding a slot to a
+manifest still requires a clean-boot physical replay of the exact profiled
+kernel Image.
 
 ## Before you begin
 
@@ -76,7 +83,8 @@ cd humane-aipin-ghostlock
 ```
 
 `check` is read-only. It prints the detected firmware, kernel, slot, shell
-boundary, SELinux state, battery, power source, and NDK revision.
+boundary, SELinux state, battery, power source, NDK revision, and build-tool
+status. Its diagnostic output masks the device serial by default.
 
 `run` performs one guarded attempt. It asks you to type
 `ROOT YOUR_SERIAL`, builds from source, verifies the payload hash after
@@ -167,6 +175,12 @@ Build the Android payload:
 
 ```sh
 ./ghostlock build
+```
+
+When more than one evidence-backed profile exists, select one explicitly:
+
+```sh
+./ghostlock build --profile humane-aipin-45.20-nov4
 ```
 
 Run all host tests and two independent builds:

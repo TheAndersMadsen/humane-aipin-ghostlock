@@ -33,9 +33,15 @@ class RecordingAdb:
 
 class ProdRunnerTest(unittest.TestCase):
     PAYLOAD_SHA256 = "a" * 64
-    PROFILE = RUNNER.load_profiles(RUNNER.PROFILES_ROOT)[0]
+    PROFILES = RUNNER.load_profiles(RUNNER.PROFILES_ROOT)
+    PROFILE = RUNNER.profile_by_id(
+        PROFILES, "humane-aipin-45.20-nov4"
+    )
 
-    def snapshot_values(self, **overrides: str) -> dict[str, str]:
+    def snapshot_values(
+        self, *, profile=None, **overrides: str
+    ) -> dict[str, str]:
+        profile = profile or self.PROFILE
         values = {
             "boot_id_begin": "11111111-2222-3333-4444-555555555555",
             "boot_epoch_begin": "1700000000",
@@ -43,14 +49,14 @@ class ProdRunnerTest(unittest.TestCase):
             "uid": "2000",
             "context": "u:r:shell:s0",
             "selinux": "Enforcing",
-            "fingerprint": self.PROFILE.fingerprint,
+            "fingerprint": profile.fingerprint,
             "kernel": (
-                f"Linux localhost {self.PROFILE.kernel_release} "
-                f"{self.PROFILE.kernel_build_marker} aarch64"
+                f"Linux localhost {profile.kernel_release} "
+                f"{profile.kernel_build_marker} {profile.kernel_machine}"
             ),
-            "kernel_release": self.PROFILE.kernel_release,
-            "slot": self.PROFILE.accepted_slots[0],
-            "abi": self.PROFILE.accepted_abis[0],
+            "kernel_release": profile.kernel_release,
+            "slot": profile.accepted_slots[0],
+            "abi": profile.accepted_abis[0],
             "payload_sha256": self.PAYLOAD_SHA256,
             "boot_id_end": "11111111-2222-3333-4444-555555555555",
             "boot_epoch_end": "1700000000",
@@ -72,7 +78,8 @@ class ProdRunnerTest(unittest.TestCase):
             if tag != omit
         )
 
-    def state(self, **overrides):
+    def state(self, *, profile=None, **overrides):
+        profile = profile or self.PROFILE
         values = {
             "serial": "SERIAL",
             "uid": "2000",
@@ -81,23 +88,24 @@ class ProdRunnerTest(unittest.TestCase):
             "boot_id": "boot",
             "boot_epoch": "1700000000",
             "uptime_seconds": 1000.0,
-            "fingerprint": self.PROFILE.fingerprint,
+            "fingerprint": profile.fingerprint,
             "kernel": (
-                f"Linux localhost {self.PROFILE.kernel_release} "
-                f"{self.PROFILE.kernel_build_marker} aarch64"
+                f"Linux localhost {profile.kernel_release} "
+                f"{profile.kernel_build_marker} {profile.kernel_machine}"
             ),
-            "kernel_release": self.PROFILE.kernel_release,
-            "slot": self.PROFILE.accepted_slots[0],
-            "abi": self.PROFILE.accepted_abis[0],
+            "kernel_release": profile.kernel_release,
+            "slot": profile.accepted_slots[0],
+            "abi": profile.accepted_abis[0],
             "payload_sha256": self.PAYLOAD_SHA256,
         }
         values.update(overrides)
         return RUNNER.DeviceState(**values)
 
-    def assert_valid(self, state) -> None:
+    def assert_valid(self, state, *, profile=None) -> None:
+        profile = profile or self.PROFILE
         RUNNER.assert_production_equivalent(
             state,
-            profile=self.PROFILE,
+            profile=profile,
             expected_payload_sha256=self.PAYLOAD_SHA256,
         )
 
@@ -198,6 +206,13 @@ class ProdRunnerTest(unittest.TestCase):
     def test_production_boundary_is_accepted(self) -> None:
         self.assert_valid(self.state())
 
+    def test_every_profile_accepts_its_own_production_boundary(self) -> None:
+        for profile in self.PROFILES:
+            with self.subTest(profile=profile.profile_id):
+                self.assert_valid(
+                    self.state(profile=profile), profile=profile
+                )
+
     def test_nearby_kernel_release_is_rejected(self) -> None:
         with self.assertRaisesRegex(RUNNER.RunnerError, "kernel release"):
             self.assert_valid(
@@ -276,7 +291,9 @@ class ProdRunnerTest(unittest.TestCase):
             f"target kernel accepted profile={self.PROFILE.profile_id} "
             f"manifest_sha256={self.PROFILE.manifest_sha256} "
             f"image_sha256={self.PROFILE.kernel_image_sha256} "
-            f"symbols_sha256={self.PROFILE.symbols_sha256} slot=_b abi=arm64-v8a\n"
+            f"symbols_sha256={self.PROFILE.symbols_sha256} "
+            f"slot={self.PROFILE.accepted_slots[0]} "
+            f"abi={self.PROFILE.accepted_abis[0]}\n"
             "perf reclaim gate result verified=1 pfn=abc memstart=def "
             "free=1 alloc=1 candidates=4 errno=0\n"
             "direct credential result uid=0 euid=0 gid=0 egid=0 "

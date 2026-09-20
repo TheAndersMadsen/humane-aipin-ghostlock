@@ -24,6 +24,7 @@ Apache-2.0 `LICENSE` is preserved at the repository root.
 | `source/src/perf_reclaim_*` | New | Same-PFN runtime gate and address math |
 | `source/src/reclaim_hold.*` | New | Socket-buffer reclaim ownership |
 | `source/src/slide_supervisor.*` | New | Child framing, deadlines, and cleanup |
+| `profiles/*`, `ghostlock_profile.py` | New | Strict target manifests, symbol binding, and host matching |
 | `runner/*`, `tools/*`, `scripts/*` | New | Host guardrails, KASLR parser, launcher, redaction, and release audit |
 | `docs/*` and project metadata | New | Public documentation and release process |
 

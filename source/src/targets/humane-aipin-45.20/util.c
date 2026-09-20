@@ -10,6 +10,7 @@
 
 #include "kernelsnitch/kernelsnitch.h"
 #include "perf_reclaim_gate.h"
+#include "profile_geometry.h"
 #include "reclaim_hold.h"
 
 static struct kernelsnitch_shared_state *ks_state;
@@ -544,14 +545,15 @@ static int load_mm_geometry(void) {
     }
   }
 
-  if (object_size != MM_STRUCT_OBJECT_SZ || slot_size != MM_STRUCT_SZ ||
-      order != MM_ORDER || slab_objects != objects_per_slab) {
+  if (!ghostlock_profile_mm_geometry_matches(
+          object_size, slot_size, order, slab_objects, cpu_partial)) {
     pr_warning("mm_struct geometry mismatch object=%llu slot=%llu order=%llu "
-               "objects=%llu\n",
+               "objects=%llu cpu_partial=%llu\n",
                (unsigned long long)object_size,
                (unsigned long long)slot_size,
                (unsigned long long)order,
-               (unsigned long long)slab_objects);
+               (unsigned long long)slab_objects,
+               (unsigned long long)cpu_partial);
     return 0;
   }
 

@@ -28,6 +28,15 @@ Install revision `28.2.13676358`:
 sdkmanager "ndk;28.2.13676358"
 ```
 
+If `sdkmanager` is not on `PATH`, use the SDK root configured by either
+`ANDROID_SDK_ROOT` or `ANDROID_HOME`:
+
+```sh
+"${ANDROID_SDK_ROOT:-$ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" "ndk;28.2.13676358"
+```
+
+The launcher recognizes both variables when locating the installed NDK.
+
 If it is installed outside the normal Android SDK path:
 
 ```sh
