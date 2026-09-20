@@ -83,8 +83,8 @@ $(PROFILE_GENERATED_DIR):
 $(PROFILE_HEADER): FORCE $(PROFILE_MANIFEST) $(PROFILE_SYMBOLS) $(TARGET_HEADER) \
   ../ghostlock_profile.py ../scripts/generate_profile_header.py | $(PROFILE_GENERATED_DIR)
 	python3 ../scripts/generate_profile_header.py \
-	  --profile $(PROFILE_MANIFEST) --project $(PROJECT) \
-	  --target-header $(TARGET_HEADER) --output $@
+	  --profile "$(PROFILE_MANIFEST)" --project "$(PROJECT)" \
+	  --target-header "$(TARGET_HEADER)" --output "$@"
 
 $(EMBED_SU): $(call pick_src,su_daemon.c) $(PROFILE_HEADER) | $(EMBEDDIR)
 	$(TARGET_CC) $(TARGET_FLAGS) $(PIE_CFLAGS) $(TARGET_CFLAGS) \

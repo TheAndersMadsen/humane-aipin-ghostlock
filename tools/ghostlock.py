@@ -324,6 +324,10 @@ def payload_path(profile: TargetProfile) -> Path:
     return SOURCE / "build" / profile.project / "bin" / "preload.so"
 
 
+def make_profile_manifest(profile: TargetProfile) -> str:
+    return os.path.relpath(profile.manifest_path, SOURCE)
+
+
 def build_payload(profile: TargetProfile, ndk_arg: str | None) -> tuple[Path, str]:
     require_command("make")
     ndk = find_ndk(ndk_arg)
@@ -343,7 +347,7 @@ def build_payload(profile: TargetProfile, ndk_arg: str | None) -> tuple[Path, st
             "clean",
             "preload",
             f"PROJECT={profile.project}",
-            f"PROFILE_MANIFEST={profile.manifest_path}",
+            f"PROFILE_MANIFEST={make_profile_manifest(profile)}",
         ],
         timeout=300,
         env=environment,

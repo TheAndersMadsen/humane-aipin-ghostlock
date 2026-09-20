@@ -45,6 +45,8 @@ DEFAULT_REMOTE_SU = "/data/local/tmp/su"
 DEFAULT_ATTEMPT_MARKER = "/data/local/tmp/.ghostlock-aipin-attempt"
 DEFAULT_MIN_BATTERY = 20
 ATTEMPT_CLAIMED_SENTINEL = "GHOSTLOCK_ATTEMPT_ALREADY_CLAIMED"
+ATTEMPT_BOOT_CHANGED_SENTINEL = "GHOSTLOCK_ATTEMPT_BOOT_CHANGED"
+ATTEMPT_BOOT_CHANGED_EXIT = 74
 FORBIDDEN_ADB_SUBCOMMANDS = frozenset(("root", "unroot"))
 PROFILES_ROOT = ROOT / "profiles"
 PHASE_DURATION_NAMES = frozenset(("preflight", "exploit", "verification"))
@@ -504,11 +506,27 @@ def acquire_same_boot_attempt(
     token = shlex.quote(attempt_token(state))
     marker = shlex.quote(marker_path)
     lock_path = shlex.quote(attempt_lock_path(state, marker_path))
+    expected_boot_id = shlex.quote(state.boot_id)
+    expected_boot_epoch = shlex.quote(state.boot_epoch)
+    boot_changed = shlex.quote(ATTEMPT_BOOT_CHANGED_SENTINEL)
     result = adb.shell(
+        "observed_boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null); "
+        "observed_boot_epoch=$(sed -n 's/^btime //p' /proc/stat | head -n 1); "
+        f"if [ \"$observed_boot_id\" != {expected_boot_id} ] || "
+        f"[ \"$observed_boot_epoch\" != {expected_boot_epoch} ]; then "
+        f"printf '%s\\n' {boot_changed}; exit {ATTEMPT_BOOT_CHANGED_EXIT}; fi; "
         f"umask 077; mkdir {lock_path} || exit 73; "
         f"printf '%s\\n' {token} > {marker}",
         check=False,
     )
+    if (
+        result.returncode == ATTEMPT_BOOT_CHANGED_EXIT
+        or ATTEMPT_BOOT_CHANGED_SENTINEL in result.stdout
+    ):
+        raise RunnerError(
+            "device rebooted immediately before the attempt; the same-boot claim "
+            "was not written and the stale KASLR base was not used"
+        )
     if result.returncode != 0:
         raise RunnerError(
             "could not atomically acquire the same-boot attempt claim; "
@@ -545,6 +563,22 @@ def build_exploit_argv(
         f"LD_PRELOAD={remote_payload}",
         "/system/bin/true",
     ]
+
+
+def build_guarded_exploit_command(
+    state: DeviceState, exploit_argv: list[str]
+) -> str:
+    expected_boot_id = shlex.quote(state.boot_id)
+    expected_boot_epoch = shlex.quote(state.boot_epoch)
+    boot_changed = shlex.quote(ATTEMPT_BOOT_CHANGED_SENTINEL)
+    return (
+        "observed_boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null); "
+        "observed_boot_epoch=$(sed -n 's/^btime //p' /proc/stat | head -n 1); "
+        f"if [ \"$observed_boot_id\" != {expected_boot_id} ] || "
+        f"[ \"$observed_boot_epoch\" != {expected_boot_epoch} ]; then "
+        f"printf '%s\\n' {boot_changed}; exit {ATTEMPT_BOOT_CHANGED_EXIT}; fi; "
+        "exec " + shlex.join(exploit_argv)
+    )
 
 
 def _signal_process_group(process: subprocess.Popen[str], sig: int) -> str | None:
@@ -698,20 +732,36 @@ def stream_process(command: list[str], log_path: Path, timeout: float) -> int:
             assert process.returncode is not None
             return process.returncode
         except BaseException as exc:
-            cleanup_error = _stop_and_reap_stream_process(process, thread)
-            drain_output()
-            if cleanup_error is not None:
-                if isinstance(exc, RunnerError):
-                    raise RunnerError(
-                        f"{exc}; cleanup failed: {cleanup_error}"
-                    ) from exc
-                raise RunnerError(
-                    f"exploit command cleanup failed: {cleanup_error}"
-                ) from exc
+            cleanup_diagnostics: list[str] = []
+            try:
+                cleanup_error = _stop_and_reap_stream_process(process, thread)
+                if cleanup_error is not None:
+                    cleanup_diagnostics.append(cleanup_error)
+            except BaseException as cleanup_exc:
+                cleanup_diagnostics.append(
+                    f"cleanup raised {type(cleanup_exc).__name__}: {cleanup_exc}"
+                )
+            try:
+                drain_output()
+            except BaseException as drain_exc:
+                cleanup_diagnostics.append(
+                    f"output drain raised {type(drain_exc).__name__}: {drain_exc}"
+                )
+            cleanup_detail = "; ".join(cleanup_diagnostics)
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                if cleanup_detail and hasattr(exc, "add_note"):
+                    exc.add_note(f"exploit cleanup issue: {cleanup_detail}")
                 raise
             if isinstance(exc, RunnerError):
+                if cleanup_detail:
+                    raise RunnerError(
+                        f"{exc}; cleanup failed: {cleanup_detail}"
+                    ) from exc
                 raise
+            if cleanup_detail:
+                raise RunnerError(
+                    f"exploit command failed: {exc}; cleanup failed: {cleanup_detail}"
+                ) from exc
             raise RunnerError(f"exploit command failed: {exc}") from exc
         finally:
             if thread is not None and not thread.is_alive():
@@ -926,7 +976,7 @@ def main(argv: list[str] | None = None) -> int:
             args.remote_payload,
             geometry=geometry,
         )
-        remote_command = shlex.join(exploit_argv)
+        remote_command = build_guarded_exploit_command(pinned, exploit_argv)
         host_command = ["adb", "-s", args.serial, "shell", remote_command]
         manifest["exploit_argv"] = exploit_argv
         write_manifest(manifest_path, manifest)

@@ -23,15 +23,16 @@ for profile in load_profiles(repo / "profiles"):
     print(
         profile.profile_id,
         profile.project,
-        profile.manifest_path,
+        profile.manifest_path.relative_to(repo),
         sep="\t",
     )
 PY
 
 tab=$(printf '\t')
 while IFS="$tab" read -r profile_id project manifest_path; do
+  make_manifest="../$manifest_path"
   make -C source clean test \
-    "PROJECT=$project" "PROFILE_MANIFEST=$manifest_path"
+    "PROJECT=$project" "PROFILE_MANIFEST=$make_manifest"
   ./ghostlock build --profile "$profile_id"
   payload="source/build/$project/bin/preload.so"
   python3 scripts/verify_payload_profile.py \

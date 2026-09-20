@@ -12,6 +12,9 @@
 - Recheck battery and external power immediately before consuming a boot's
   atomic attempt claim, reject concurrent runners, and add allowlisted phase
   durations to reduced reports.
+- Recheck boot identity inside both the atomic claim and exploit exec shell,
+  preserve user cancellation through cleanup failures, and support repository
+  checkout paths containing spaces.
 
 ## 0.1.0 - 2026-09-20
 

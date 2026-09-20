@@ -42,10 +42,12 @@ class AttemptAdb:
         *,
         battery_returncode: int = 0,
         acquisition_returncode: int = 0,
+        acquisition_output: str = "",
     ) -> None:
         self.battery = battery
         self.battery_returncode = battery_returncode
         self.acquisition_returncode = acquisition_returncode
+        self.acquisition_output = acquisition_output
         self.calls: list[str] = []
 
     def shell(self, command: str, **_kwargs) -> subprocess.CompletedProcess[str]:
@@ -55,7 +57,7 @@ class AttemptAdb:
                 (command,), self.battery_returncode, self.battery, ""
             )
         return subprocess.CompletedProcess(
-            (command,), self.acquisition_returncode, "", ""
+            (command,), self.acquisition_returncode, self.acquisition_output, ""
         )
 
 
@@ -304,6 +306,45 @@ class ProdRunnerTest(unittest.TestCase):
                     timeout=1.0,
                 )
 
+    def test_stream_cancellation_survives_cleanup_and_drain_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "stream.log"
+            real_cleanup = RUNNER._stop_and_reap_stream_process
+
+            def cleanup_then_report(process, reader_thread):
+                error = real_cleanup(process, reader_thread)
+                self.assertIsNone(error)
+                return "synthetic cleanup failure"
+
+            with (
+                mock.patch.object(
+                    RUNNER.queue.Queue,
+                    "get",
+                    side_effect=KeyboardInterrupt(),
+                ),
+                mock.patch.object(
+                    RUNNER.queue.Queue,
+                    "get_nowait",
+                    side_effect=OSError("synthetic drain failure"),
+                ),
+                mock.patch.object(
+                    RUNNER,
+                    "_stop_and_reap_stream_process",
+                    side_effect=cleanup_then_report,
+                ),
+                self.assertRaises(KeyboardInterrupt) as caught,
+            ):
+                RUNNER.stream_process(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    log_path,
+                    timeout=1.0,
+                )
+
+            notes = getattr(caught.exception, "__notes__", ())
+            if notes:
+                self.assertIn("synthetic cleanup failure", notes[0])
+                self.assertIn("synthetic drain failure", notes[0])
+
     def test_capture_state_rejects_duplicate_tag(self) -> None:
         snapshot = self.snapshot_text()
         duplicate = (
@@ -391,8 +432,34 @@ class ProdRunnerTest(unittest.TestCase):
         )
 
         self.assertEqual(adb.calls[0], "dumpsys battery")
-        self.assertLess(adb.calls[1].index("mkdir"), adb.calls[1].index("printf"))
+        claim = adb.calls[1]
+        self.assertLess(claim.index("observed_boot_id"), claim.index("mkdir"))
+        self.assertLess(claim.index("observed_boot_epoch"), claim.index("mkdir"))
+        self.assertLess(claim.index("mkdir"), claim.rindex("printf"))
         self.assertEqual(len(adb.calls), 2)
+
+    def test_reboot_before_atomic_claim_stops_without_using_stale_kaslr(self) -> None:
+        adb = AttemptAdb(
+            "USB powered: true\nlevel: 100\n",
+            acquisition_returncode=RUNNER.ATTEMPT_BOOT_CHANGED_EXIT,
+            acquisition_output=RUNNER.ATTEMPT_BOOT_CHANGED_SENTINEL + "\n",
+        )
+
+        with self.assertRaisesRegex(
+            RUNNER.RunnerError, "rebooted immediately before the attempt"
+        ):
+            RUNNER.acquire_same_boot_attempt(
+                adb,
+                self.state(),
+                RUNNER.DEFAULT_ATTEMPT_MARKER,
+                min_battery=20,
+            )
+
+        self.assertEqual(adb.calls[0], "dumpsys battery")
+        claim = adb.calls[1]
+        self.assertLess(claim.index("exit 74"), claim.index("mkdir"))
+        self.assertIn(self.state().boot_id, claim)
+        self.assertIn(self.state().boot_epoch, claim)
 
     def test_attempt_claim_is_not_consumed_when_power_gate_fails(self) -> None:
         cases = (
@@ -425,7 +492,7 @@ class ProdRunnerTest(unittest.TestCase):
         )
 
         self.assertEqual(len(adb.calls), 1)
-        self.assertLess(adb.calls[0].index("mkdir"), adb.calls[0].index("printf"))
+        self.assertLess(adb.calls[0].index("mkdir"), adb.calls[0].rindex("printf"))
 
     def test_failed_atomic_acquisition_stops_the_attempt(self) -> None:
         adb = AttemptAdb(
@@ -561,6 +628,23 @@ class ProdRunnerTest(unittest.TestCase):
         rendered = " ".join(argv)
         self.assertIn("AI_PIN_MM_OBJECT_SIZE=872", rendered)
         self.assertIn("AI_PIN_MM_SLAB_SIZE=896", rendered)
+
+    def test_exploit_launch_rechecks_boot_in_the_exec_shell(self) -> None:
+        state = self.state()
+        argv = RUNNER.build_exploit_argv(
+            0xFFFFFF9F85880000,
+            "/data/local/tmp/preload.so",
+            geometry=self.PROFILE.allocator_geometry,
+        )
+
+        command = RUNNER.build_guarded_exploit_command(state, argv)
+
+        self.assertIn(state.boot_id, command)
+        self.assertIn(state.boot_epoch, command)
+        self.assertIn(RUNNER.ATTEMPT_BOOT_CHANGED_SENTINEL, command)
+        self.assertLess(command.index("observed_boot_id"), command.index("exec "))
+        self.assertLess(command.index("exit 74"), command.index("exec "))
+        self.assertEqual(command.count("/system/bin/env"), 1)
 
     def test_same_boot_rejects_boot_change(self) -> None:
         with self.assertRaises(RUNNER.RunnerError):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -135,6 +136,36 @@ class HostDiagnosticsTests(unittest.TestCase):
         )
         self.assertIn(f"TARGET_CC={expected}", result.stdout)
         self.assertNotIn("TARGET_CC=/usr/bin/false", result.stdout)
+
+    def test_profile_header_build_supports_repository_paths_with_spaces(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ghost lock ") as temporary:
+            checkout = Path(temporary) / "source checkout"
+            shutil.copytree(
+                GHOSTLOCK.ROOT,
+                checkout,
+                ignore=shutil.ignore_patterns(".git", "build", "__pycache__"),
+            )
+            target = (
+                "build/humane-aipin-45.20/generated/"
+                "ghostlock_profile_generated.h"
+            )
+            result = subprocess.run(
+                [
+                    "make",
+                    "-C",
+                    str(checkout / "source"),
+                    target,
+                    "PROJECT=humane-aipin-45.20",
+                    "PROFILE_MANIFEST=../profiles/humane-45.20/profile.json",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertTrue((checkout / "source" / target).is_file())
 
     def test_command_check_rejects_ndk_without_host_compiler(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
