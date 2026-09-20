@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,9 +15,62 @@ sys.path.insert(0, str(Path(__file__).parent))
 import ghostlock_prod_runner as RUNNER  # noqa: E402
 
 
+class RecordingAdb:
+    def __init__(self, snapshot: str, *, state: str = "device") -> None:
+        self.serial = "SERIAL"
+        self.snapshot = snapshot
+        self.state = state
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def run(self, *args: str, **_kwargs) -> subprocess.CompletedProcess[str]:
+        self.calls.append(("run", args))
+        return subprocess.CompletedProcess(args, 0, self.state + "\n", "")
+
+    def shell(self, command: str, **_kwargs) -> subprocess.CompletedProcess[str]:
+        self.calls.append(("shell", (command,)))
+        return subprocess.CompletedProcess((command,), 0, self.snapshot, "")
+
+
 class ProdRunnerTest(unittest.TestCase):
     PAYLOAD_SHA256 = "a" * 64
     PROFILE = RUNNER.load_profiles(RUNNER.PROFILES_ROOT)[0]
+
+    def snapshot_values(self, **overrides: str) -> dict[str, str]:
+        values = {
+            "boot_id_begin": "11111111-2222-3333-4444-555555555555",
+            "boot_epoch_begin": "1700000000",
+            "uptime_begin": "1000.00",
+            "uid": "2000",
+            "context": "u:r:shell:s0",
+            "selinux": "Enforcing",
+            "fingerprint": self.PROFILE.fingerprint,
+            "kernel": (
+                f"Linux localhost {self.PROFILE.kernel_release} "
+                f"{self.PROFILE.kernel_build_marker} aarch64"
+            ),
+            "kernel_release": self.PROFILE.kernel_release,
+            "slot": self.PROFILE.accepted_slots[0],
+            "abi": self.PROFILE.accepted_abis[0],
+            "payload_sha256": self.PAYLOAD_SHA256,
+            "boot_id_end": "11111111-2222-3333-4444-555555555555",
+            "boot_epoch_end": "1700000000",
+            "uptime_end": "1000.25",
+        }
+        values.update(overrides)
+        return values
+
+    def snapshot_text(
+        self,
+        values: dict[str, str] | None = None,
+        *,
+        omit: str | None = None,
+    ) -> str:
+        values = values or self.snapshot_values()
+        return "".join(
+            f"{RUNNER.STATE_SNAPSHOT_PREFIX}\t{tag}\t{values[tag]}\n"
+            for tag in RUNNER.STATE_SNAPSHOT_FIELDS
+            if tag != omit
+        )
 
     def state(self, **overrides):
         values = {
@@ -46,6 +100,96 @@ class ProdRunnerTest(unittest.TestCase):
             profile=self.PROFILE,
             expected_payload_sha256=self.PAYLOAD_SHA256,
         )
+
+    def test_capture_state_uses_two_adb_commands_and_preserves_fields(self) -> None:
+        adb = RecordingAdb(self.snapshot_text())
+
+        state = RUNNER.capture_state(adb, "/data/local/tmp/preload.so")
+
+        self.assertEqual(len(adb.calls), 2)
+        self.assertEqual(adb.calls[0], ("run", ("get-state",)))
+        self.assertEqual(adb.calls[1][0], "shell")
+        shell_command = adb.calls[1][1][0]
+        self.assertLess(
+            shell_command.index("boot_id_begin"),
+            shell_command.index("boot_id_end"),
+        )
+        self.assertEqual(state.kernel_release, self.PROFILE.kernel_release)
+        self.assertEqual(state.payload_sha256, self.PAYLOAD_SHA256)
+        self.assertEqual(state.uptime_seconds, 1000.25)
+
+    def test_capture_state_rejects_duplicate_tag(self) -> None:
+        snapshot = self.snapshot_text()
+        duplicate = (
+            f"{RUNNER.STATE_SNAPSHOT_PREFIX}\tuid\t2000\n"
+        )
+        adb = RecordingAdb(snapshot + duplicate)
+
+        with self.assertRaisesRegex(RUNNER.RunnerError, "duplicate.*uid"):
+            RUNNER.capture_state(adb, "/data/local/tmp/preload.so")
+
+    def test_capture_state_rejects_missing_tag(self) -> None:
+        adb = RecordingAdb(self.snapshot_text(omit="kernel_release"))
+
+        with self.assertRaisesRegex(RUNNER.RunnerError, "missing.*kernel_release"):
+            RUNNER.capture_state(adb, "/data/local/tmp/preload.so")
+
+    def test_capture_state_rejects_malformed_record(self) -> None:
+        adb = RecordingAdb("unexpected output\n" + self.snapshot_text())
+
+        with self.assertRaisesRegex(RUNNER.RunnerError, "malformed.*line 1"):
+            RUNNER.capture_state(adb, "/data/local/tmp/preload.so")
+
+    def test_capture_state_rejects_unknown_tag(self) -> None:
+        snapshot = self.snapshot_text() + (
+            f"{RUNNER.STATE_SNAPSHOT_PREFIX}\tunknown\tvalue\n"
+        )
+        adb = RecordingAdb(snapshot)
+
+        with self.assertRaisesRegex(RUNNER.RunnerError, "unexpected.*unknown"):
+            RUNNER.capture_state(adb, "/data/local/tmp/preload.so")
+
+    def test_capture_state_rejects_mixed_boot_identity(self) -> None:
+        changes = (
+            ("boot_id_end", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "boot ID"),
+            ("boot_epoch_end", "1700000001", "boot epoch"),
+            ("uptime_end", "1.00", "uptime moved backwards"),
+        )
+        for tag, value, error in changes:
+            with self.subTest(tag=tag):
+                adb = RecordingAdb(
+                    self.snapshot_text(self.snapshot_values(**{tag: value}))
+                )
+                with self.assertRaisesRegex(RUNNER.RunnerError, error):
+                    RUNNER.capture_state(adb, "/data/local/tmp/preload.so")
+
+    def test_capture_state_allows_expected_post_exploit_boot_id_scratch(self) -> None:
+        scratch = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        adb = RecordingAdb(
+            self.snapshot_text(self.snapshot_values(boot_id_end=scratch))
+        )
+
+        state = RUNNER.capture_state(
+            adb,
+            "/data/local/tmp/preload.so",
+            allow_boot_id_scratch=True,
+        )
+
+        self.assertEqual(state.boot_id, scratch)
+        self.assertEqual(state.boot_epoch, "1700000000")
+
+    def test_capture_state_rejects_malformed_hash_and_uptime(self) -> None:
+        changes = (
+            ("payload_sha256", "not-a-hash", "cannot hash remote payload"),
+            ("uptime_end", "nan", "invalid kernel uptime"),
+        )
+        for tag, value, error in changes:
+            with self.subTest(tag=tag):
+                adb = RecordingAdb(
+                    self.snapshot_text(self.snapshot_values(**{tag: value}))
+                )
+                with self.assertRaisesRegex(RUNNER.RunnerError, error):
+                    RUNNER.capture_state(adb, "/data/local/tmp/preload.so")
 
     def test_uid_zero_is_rejected(self) -> None:
         with self.assertRaises(RUNNER.RunnerError):

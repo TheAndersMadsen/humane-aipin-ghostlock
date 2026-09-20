@@ -45,6 +45,24 @@ DEFAULT_REMOTE_SU = "/data/local/tmp/su"
 DEFAULT_ATTEMPT_MARKER = "/data/local/tmp/.ghostlock-aipin-attempt"
 FORBIDDEN_ADB_SUBCOMMANDS = frozenset(("root", "unroot"))
 PROFILES_ROOT = ROOT / "profiles"
+STATE_SNAPSHOT_PREFIX = "GHOSTLOCK_STATE_V1"
+STATE_SNAPSHOT_FIELDS = (
+    "boot_id_begin",
+    "boot_epoch_begin",
+    "uptime_begin",
+    "uid",
+    "context",
+    "selinux",
+    "fingerprint",
+    "kernel",
+    "kernel_release",
+    "slot",
+    "abi",
+    "payload_sha256",
+    "boot_id_end",
+    "boot_epoch_end",
+    "uptime_end",
+)
 
 
 class RunnerError(RuntimeError):
@@ -130,46 +148,124 @@ class Adb:
         return self.run("shell", command, timeout=timeout, check=check)
 
 
-def shell_value(adb: Adb, command: str) -> str:
-    return adb.shell(command).stdout.strip()
+def _state_snapshot_command(remote_payload: str) -> str:
+    payload = shlex.quote(remote_payload)
+    commands = (
+        ("boot_id_begin", "cat /proc/sys/kernel/random/boot_id"),
+        ("boot_epoch_begin", "sed -n 's/^btime //p' /proc/stat | head -n 1"),
+        ("uptime_begin", "cut -d ' ' -f 1 /proc/uptime"),
+        ("uid", "id -u"),
+        ("context", "id -Z"),
+        ("selinux", "getenforce"),
+        ("fingerprint", "getprop ro.build.fingerprint"),
+        ("kernel", "uname -a"),
+        ("kernel_release", "uname -r"),
+        ("slot", "getprop ro.boot.slot_suffix"),
+        ("abi", "getprop ro.product.cpu.abi"),
+        (
+            "payload_sha256",
+            f"toybox sha256sum {payload} 2>/dev/null | cut -c 1-64",
+        ),
+        ("boot_id_end", "cat /proc/sys/kernel/random/boot_id"),
+        ("boot_epoch_end", "sed -n 's/^btime //p' /proc/stat | head -n 1"),
+        ("uptime_end", "cut -d ' ' -f 1 /proc/uptime"),
+    )
+    emit = (
+        "emit() { printf '"
+        + STATE_SNAPSHOT_PREFIX
+        + "\\t%s\\t%s\\n' \"$1\" \"$2\"; };"
+    )
+    samples = [
+        f"emit {shlex.quote(tag)} \"$({command})\""
+        for tag, command in commands
+    ]
+    return " ".join((emit, "; ".join(samples)))
 
 
-def capture_state(adb: Adb, remote_payload: str) -> DeviceState:
+def _parse_state_snapshot(text: str) -> dict[str, str]:
+    expected = frozenset(STATE_SNAPSHOT_FIELDS)
+    values: dict[str, str] = {}
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        fields = line.split("\t")
+        if len(fields) != 3 or fields[0] != STATE_SNAPSHOT_PREFIX:
+            raise RunnerError(f"malformed device-state record at line {line_number}")
+        tag, value = fields[1:]
+        if tag not in expected:
+            raise RunnerError(f"unexpected device-state tag {tag!r}")
+        if tag in values:
+            raise RunnerError(f"duplicate device-state tag {tag!r}")
+        if (
+            not value
+            or value != value.strip()
+            or not value.isascii()
+            or not value.isprintable()
+        ):
+            raise RunnerError(f"invalid device-state value for {tag!r}")
+        values[tag] = value
+
+    missing = [tag for tag in STATE_SNAPSHOT_FIELDS if tag not in values]
+    if missing:
+        raise RunnerError("missing device-state tag(s): " + ", ".join(missing))
+    return values
+
+
+def _parse_uptime(value: str, tag: str) -> float:
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value):
+        raise RunnerError(f"invalid kernel uptime for {tag!r}: {value!r}")
+    uptime = float(value)
+    if uptime < 0:
+        raise RunnerError(f"invalid negative kernel uptime for {tag!r}: {value!r}")
+    return uptime
+
+
+def capture_state(
+    adb: Adb,
+    remote_payload: str,
+    *,
+    allow_boot_id_scratch: bool = False,
+) -> DeviceState:
     state = adb.run("get-state").stdout.strip()
     if state != "device":
         raise RunnerError(f"adb state is {state!r}, expected 'device'")
-    remote_sha = shell_value(
-        adb, f"toybox sha256sum {shlex.quote(remote_payload)} 2>/dev/null"
-    ).split()
-    if not remote_sha:
-        raise RunnerError(f"cannot hash remote payload {remote_payload}")
-    boot_epoch = shell_value(
-        adb, "sed -n 's/^btime //p' /proc/stat | head -n 1"
+    snapshot = _parse_state_snapshot(
+        adb.shell(_state_snapshot_command(remote_payload)).stdout
     )
-    uptime_text = shell_value(adb, "cut -d ' ' -f 1 /proc/uptime")
-    if not re.fullmatch(r"[0-9]+", boot_epoch):
-        raise RunnerError(f"invalid kernel boot epoch {boot_epoch!r}")
-    try:
-        uptime_seconds = float(uptime_text)
-    except ValueError as exc:
-        raise RunnerError(f"invalid kernel uptime {uptime_text!r}") from exc
-    if uptime_seconds < 0:
-        raise RunnerError(f"invalid negative kernel uptime {uptime_seconds}")
+    if (
+        not allow_boot_id_scratch
+        and snapshot["boot_id_begin"] != snapshot["boot_id_end"]
+    ):
+        raise RunnerError("kernel boot ID changed during device-state capture")
+    if snapshot["boot_epoch_begin"] != snapshot["boot_epoch_end"]:
+        raise RunnerError("kernel boot epoch changed during device-state capture")
+    if not re.fullmatch(r"[0-9]+", snapshot["boot_epoch_end"]):
+        raise RunnerError(
+            f"invalid kernel boot epoch {snapshot['boot_epoch_end']!r}"
+        )
+    uptime_begin = _parse_uptime(snapshot["uptime_begin"], "uptime_begin")
+    uptime_end = _parse_uptime(snapshot["uptime_end"], "uptime_end")
+    if uptime_end + 2.0 < uptime_begin:
+        raise RunnerError(
+            "device uptime moved backwards during state capture: "
+            f"{uptime_begin:.2f}->{uptime_end:.2f}"
+        )
+    remote_sha = snapshot["payload_sha256"]
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", remote_sha):
+        raise RunnerError(f"cannot hash remote payload {remote_payload}")
 
     return DeviceState(
         serial=adb.serial,
-        uid=shell_value(adb, "id -u"),
-        context=shell_value(adb, "id -Z"),
-        selinux=shell_value(adb, "getenforce"),
-        boot_id=shell_value(adb, "cat /proc/sys/kernel/random/boot_id"),
-        boot_epoch=boot_epoch,
-        uptime_seconds=uptime_seconds,
-        fingerprint=shell_value(adb, "getprop ro.build.fingerprint"),
-        kernel=shell_value(adb, "uname -a"),
-        kernel_release=shell_value(adb, "uname -r"),
-        slot=shell_value(adb, "getprop ro.boot.slot_suffix"),
-        abi=shell_value(adb, "getprop ro.product.cpu.abi"),
-        payload_sha256=remote_sha[0].lower(),
+        uid=snapshot["uid"],
+        context=snapshot["context"],
+        selinux=snapshot["selinux"],
+        boot_id=snapshot["boot_id_end"],
+        boot_epoch=snapshot["boot_epoch_end"],
+        uptime_seconds=uptime_end,
+        fingerprint=snapshot["fingerprint"],
+        kernel=snapshot["kernel"],
+        kernel_release=snapshot["kernel_release"],
+        slot=snapshot["slot"],
+        abi=snapshot["abi"],
+        payload_sha256=remote_sha.lower(),
     )
 
 
@@ -585,7 +681,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         manifest["exploit_returncode"] = exploit_rc
 
-        final_state = capture_state(adb, args.remote_payload)
+        # The exploit deliberately repoints the boot_id sysctl data pointer.
+        # Keep sampling both values, but bind the post-exploit snapshot to the
+        # stable kernel boot epoch and uptime instead of the scratch UUID.
+        final_state = capture_state(
+            adb, args.remote_payload, allow_boot_id_scratch=True
+        )
         assert_same_boot(initial, final_state, allow_boot_id_scratch=True)
         manifest["final_state"] = asdict(final_state)
         manifest["boot_id_scratch_observed"] = (
