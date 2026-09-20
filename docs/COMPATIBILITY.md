@@ -19,6 +19,10 @@ profile. The runner cannot read the retail boot partition from an unprivileged
 ADB shell, so its live executable gates are the complete fingerprint, kernel
 markers, slot, ABI, UID, SELinux context, and enforcing state.
 
+The build fingerprint is a userspace property and does not prove that both A/B
+boot slots contain the same kernel. Never remove the slot or kernel gate merely
+because the fingerprint matches.
+
 ## Explicitly unsupported
 
 - slot `_a`;

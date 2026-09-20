@@ -31,6 +31,9 @@ anything. A mismatch stops the run.
 
 Slot `_a`, developer firmware, nearby firmware versions, and other Qualcomm
 `atoll` products are rejected. See [compatibility details](docs/COMPATIBILITY.md).
+A matching Android fingerprint is not enough to bypass this check: A/B slots
+can carry different boot images and kernel layouts under the same userspace
+build identity.
 
 ## Before you begin
 
