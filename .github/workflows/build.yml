@@ -17,8 +17,13 @@ jobs:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Install pinned Android NDK
-        run: sdkmanager "ndk;28.2.13676358"
+      - name: Ensure pinned Android NDK
+        run: |
+          ndk_clang="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
+          if [[ ! -x "$ndk_clang" ]]; then
+            "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "ndk;28.2.13676358"
+          fi
+          test -x "$ndk_clang"
 
       - name: Verify tests, privacy audit, and reproducible build
         run: |
