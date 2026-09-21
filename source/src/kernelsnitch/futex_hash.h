@@ -1,6 +1,3 @@
-/* SPDX-License-Identifier: Apache-2.0
- * Modified for the Humane AI Pin vendor 4.14 futex key and hash table.
- */
 #pragma once
 
 #include "utils.h"

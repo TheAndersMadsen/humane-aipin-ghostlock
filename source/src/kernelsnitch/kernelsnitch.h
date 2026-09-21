@@ -1,6 +1,3 @@
-/* SPDX-License-Identifier: Apache-2.0
- * Modified for bounded, verified Humane AI Pin timing searches.
- */
 #pragma once
 
 #include "timeutils.h"

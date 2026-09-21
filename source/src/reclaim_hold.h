@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: Apache-2.0 */
 #ifndef RECLAIM_HOLD_H
 #define RECLAIM_HOLD_H
 

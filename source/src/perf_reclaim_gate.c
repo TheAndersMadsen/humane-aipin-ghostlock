@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: Apache-2.0 */
 #define _GNU_SOURCE
 
 #include "perf_reclaim_gate.h"

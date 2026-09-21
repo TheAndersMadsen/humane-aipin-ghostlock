@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: Apache-2.0 */
 #ifndef AI_PIN_SLIDE_SUPERVISOR_H
 #define AI_PIN_SLIDE_SUPERVISOR_H
 

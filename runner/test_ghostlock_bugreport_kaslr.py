@@ -19,7 +19,7 @@ SPEC.loader.exec_module(KASLR)
 
 
 BOOT_ID = "a7f9be5d-5f1f-4555-8c0d-48f76f6ff12e"
-SERIAL = "TESTSERIAL000000"
+SERIAL = "1H4MPA3B304157"
 FINGERPRINT = (
     "qti/atoll/atoll:12/SKQ1.230401.001/101.000470.45.10:userdebug/test-keys"
 )

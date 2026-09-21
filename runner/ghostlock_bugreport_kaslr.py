@@ -228,7 +228,7 @@ def parse_bugreport(
     symbols = load_symbols(symbols_path)
     member, report = _read_report(zip_path)
 
-    if expected_boot_id and f"linuxBootId={expected_boot_id}" not in report:
+    if expected_boot_id and "linuxBootId=" in report and f"linuxBootId={expected_boot_id}" not in report:
         raise KaslrParseError(
             f"bugreport does not contain current boot ID {expected_boot_id}"
         )

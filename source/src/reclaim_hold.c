@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: Apache-2.0 */
 #include "reclaim_hold.h"
 
 #include <errno.h>
@@ -110,10 +109,10 @@ int ghostlock_reclaim_hold_one(struct ghostlock_reclaim_batch *batch,
       .iov_base = (void *)payload,
       .iov_len = payload_len,
   };
-  struct msghdr msg = {
-      .msg_iov = &iov,
-      .msg_iovlen = 1,
-  };
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
 
   int flags = MSG_DONTWAIT;
 #ifdef MSG_NOSIGNAL

@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: Apache-2.0 */
 #include "perf_reclaim_gate.h"
 
 #include "offset.h"

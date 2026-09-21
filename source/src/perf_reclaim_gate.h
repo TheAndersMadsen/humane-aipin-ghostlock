@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: Apache-2.0 */
 #ifndef GHOSTLOCK_PERF_RECLAIM_GATE_H
 #define GHOSTLOCK_PERF_RECLAIM_GATE_H
 
