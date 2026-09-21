@@ -38,6 +38,7 @@ PINNED_NDK_VERSION = "28.2.13676358"
 NDK_TARGET_COMPILER = "aarch64-linux-android35-clang"
 RUNNER = ROOT / "runner/ghostlock_prod_runner.py"
 REDACTOR = ROOT / "tools/redact_report.py"
+RUN_ATTEMPTS = 3
 REMOTE_PAYLOAD = "/data/local/tmp/ghostlock-aipin.so"
 REMOTE_SU = "/data/local/tmp/su"
 DEFAULT_MIN_BATTERY = 20
@@ -341,21 +342,17 @@ def build_payload(profile: TargetProfile, ndk_arg: str | None) -> tuple[Path, st
     environment = os.environ.copy()
     environment["NDK_ROOT"] = str(ndk)
     print(f"Building with Android NDK: {ndk}")
-    result = run(
-        [
-            "make",
-            "-C",
-            str(SOURCE),
-            "clean",
-            "preload",
-            f"PROJECT={profile.project}",
-            f"PROFILE_MANIFEST={make_profile_manifest(profile)}",
-        ],
-        timeout=300,
-        env=environment,
-    )
+    base = ["make", "-C", str(SOURCE), f"PROJECT={profile.project}"]
+    result = run(base + ["preload"], timeout=300, env=environment)
     print(result.stdout, end="")
     payload = payload_path(profile)
+    if not payload.is_file():
+        # incremental build failed (stale objects or toolchain change):
+        # one clean-room rebuild before giving up.
+        print("incremental build produced nothing; rebuilding from a clean tree …")
+        result = run(base + ["clean", "preload"], timeout=300, env=environment)
+        print(result.stdout, end="")
+        payload = payload_path(profile)
     if not payload.is_file():
         raise GhostLockError(f"build succeeded without producing {payload}")
     digest = sha256(payload)
@@ -593,33 +590,53 @@ def command_run(args: argparse.Namespace) -> int:
     push_payload(serial, payload, digest)
 
     output = evidence_path(args.output_dir)
-    bugreport_parent = Path(tempfile.mkdtemp(prefix="ghostlock-br-"))
-    bugreport = bugreport_parent / "bugreport.zip"
-    capture_bugreport(serial, bugreport)
-
     started = time.time()
-    command = build_runner_argv(
-        serial=serial,
-        profile=profile,
-        payload_sha256=digest,
-        bugreport=bugreport,
-        output_dir=output,
-    )
-    print(f"Private log: {output}")
-    print("Starting guarded exploit chain …")
-    result = subprocess.run(command, cwd=ROOT, check=False)
-    elapsed = int(time.time() - started)
+    summary = ""
+    for attempt in range(1, RUN_ATTEMPTS + 1):
+        print(f"\n=== root attempt {attempt}/{RUN_ATTEMPTS} ===")
+        bugreport_parent = Path(tempfile.mkdtemp(prefix="ghostlock-br-"))
+        bugreport = bugreport_parent / "bugreport.zip"
+        capture_bugreport(serial, bugreport)
 
-    if args.retain_bugreport and bugreport.is_file():
-        shutil.copy(bugreport, output / "bugreport.zip")
-    shutil.rmtree(bugreport_parent, ignore_errors=True)
-    if not args.retain_bugreport:
-        pass
-    if result.returncode != 0:
-        raise GhostLockError(
-            f"runner failed closed with exit {result.returncode}; inspect {output}"
+        command = build_runner_argv(
+            serial=serial,
+            profile=profile,
+            payload_sha256=digest,
+            bugreport=bugreport,
+            output_dir=output,
         )
-    print(f"\nChain completed in {elapsed}s.")
+        print(f"Private log: {output}")
+        print("Starting guarded exploit chain …")
+        result = subprocess.run(command, cwd=ROOT, check=False)
+
+        if verify_root(serial):
+            elapsed = int(time.time() - started)
+            summary = f"root achieved on attempt {attempt}/{RUN_ATTEMPTS} ({elapsed}s)"
+            break
+
+        # A failed attempt can leave the device rebooting; wait it out and
+        # re-stage (fresh boot = fresh Enforcing state and fresh delta).
+        print("attempt failed; waiting for the device before the next one …")
+        wait_for_device(serial, seconds=300)
+        time.sleep(20)
+        info = inspect_device(serial)
+        if info.selinux == "Permissive":
+            print("boot came back permissive; rebooting once more …")
+            adb(serial, "reboot")
+            wait_for_device(serial, seconds=300)
+            time.sleep(20)
+    else:
+        elapsed = int(time.time() - started)
+        raise GhostLockError(
+            f"no root after {RUN_ATTEMPTS} attempts ({elapsed}s); "
+            "reboot the pin and try again on a fresh boot"
+        )
+
+    if args.retain_bugreport:
+        keep = output / "bugreport.zip"
+        shutil.copy(bugreport, keep)
+
+    print(f"\nChain completed. {summary}")
     print("\nIndependent fresh-shell verification:")
     if not verify_root(serial):
         raise GhostLockError("runner completed but independent root verification failed")
