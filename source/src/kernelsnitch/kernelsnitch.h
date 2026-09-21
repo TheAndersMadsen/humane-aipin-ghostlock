@@ -18,15 +18,15 @@
 #define __INTEL
 #endif
 
-#define FUTEX_SZ (64ULL<<30)
-#define FUTEX_MMAP_SZ (1ULL<<30)
+#define FUTEX_SZ (8ULL<<30)
+#define FUTEX_MMAP_SZ (8ULL<<20)
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
 #endif
 #ifndef KS_PAGE_SIZE
 #define KS_PAGE_SIZE PAGE_SIZE
 #endif
-#define APPENDED_FUTEXES 4096
+#define APPENDED_FUTEXES 1024
 #define MULITPLE 4
 #if defined(__INTEL) || defined(__AMD)
 #define IDENTITY_START 0xffff888000000000ULL
