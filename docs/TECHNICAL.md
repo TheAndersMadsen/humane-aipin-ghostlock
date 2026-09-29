@@ -71,9 +71,11 @@ so a failed child cannot silently continue into a second trigger.
 ### 6. Read and write primitives
 
 The boot ID sysctl data pointer acts as a bounded read-back oracle. The route
-resolves the per-CPU current-task pointer, updates `real_cred` and `cred`,
-repairs the credential ID fields, and clears SELinux enforcing. It reloads the
-existing policy rather than installing a new policy.
+resolves the per-CPU current-task pointer and updates `real_cred` and `cred`.
+Each pointer write has a collateral effect on `init_cred`, so its supervised
+child must route the ID-field repair before returning success. The `cred`
+child may clear SELinux enforcing only after that repair. The payload then
+reloads the existing policy rather than installing a new policy.
 
 ### 7. Boot-scoped command broker
 

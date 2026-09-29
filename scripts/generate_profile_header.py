@@ -70,9 +70,9 @@ def render_header(profile: TargetProfile) -> str:
 #define BUILD_SLOT_COUNT {len(profile.accepted_slots)}
 #define BUILD_ABIS {c_array(profile.accepted_abis)}
 #define BUILD_ABI_COUNT {len(profile.accepted_abis)}
-#define TARGET_KERNEL_RELEASE {c_string(profile.kernel_release)}
-#define TARGET_KERNEL_BUILD_MARKER {c_string(profile.kernel_build_marker)}
-#define TARGET_KERNEL_MACHINE {c_string(profile.kernel_machine)}
+#define PROFILE_KERNEL_RELEASE {c_string(profile.kernel_release)}
+#define PROFILE_KERNEL_BUILD_MARKER {c_string(profile.kernel_build_marker)}
+#define PROFILE_KERNEL_MACHINE {c_string(profile.kernel_machine)}
 #define TARGET_KERNEL_IMAGE_SHA256 {c_string(profile.kernel_image_sha256)}
 #define PROFILE_MANIFEST_SHA256 {c_string(profile.manifest_sha256)}
 #define PROFILE_SYMBOLS_SHA256 {c_string(profile.symbols_sha256)}

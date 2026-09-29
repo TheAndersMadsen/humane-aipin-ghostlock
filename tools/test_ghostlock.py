@@ -111,6 +111,14 @@ class HostDiagnosticsTests(unittest.TestCase):
                     with mock.patch.dict(os.environ, environment, clear=False):
                         self.assertEqual(GHOSTLOCK.find_ndk(None), ndk.resolve())
 
+    def test_default_evidence_path_uses_host_temp_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            GHOSTLOCK.tempfile, "gettempdir", return_value=temporary
+        ):
+            path = GHOSTLOCK.evidence_path(None)
+        self.assertEqual(path.parent, Path(temporary))
+        self.assertTrue(path.name.startswith("ghostlock-aipin-"))
+
     def test_generic_cc_cannot_override_pinned_android_compiler(self) -> None:
         ndk = Path("/tmp/ghostlock-pinned-ndk")
         environment = os.environ.copy()
@@ -334,13 +342,21 @@ class TargetTests(unittest.TestCase):
         self.assertIsNone(profile)
         self.assertIn("firmware fingerprint", mismatches[0])
 
-    def test_unproven_slot_a_is_rejected(self) -> None:
-        info = self.info(slot="_a")
+    def test_profile_accepts_both_evidence_backed_slots(self) -> None:
+        for slot in ("_a", "_b"):
+            with self.subTest(slot=slot):
+                info = self.info(slot=slot)
+                profile, mismatches = GHOSTLOCK.evaluate_device(info, self.PROFILES)
+                self.assertEqual(profile, self.PROFILE)
+                self.assertEqual(mismatches, ())
+
+    def test_unknown_slot_is_rejected(self) -> None:
+        info = self.info(slot="")
         profile, mismatches = GHOSTLOCK.evaluate_device(info, self.PROFILES)
         self.assertIsNone(profile)
         self.assertEqual(
             mismatches,
-            ("active slot: expected '_b', observed '_a'",),
+            ("active slot: expected one of ('_a', '_b'), observed ''",),
         )
 
     def test_nearby_kernel_release_is_rejected(self) -> None:
@@ -384,6 +400,17 @@ class LauncherSafetyTests(unittest.TestCase):
         index = command.index("--min-battery")
         self.assertEqual(command[index + 1], "37")
         self.assertEqual(command.count("--min-battery"), 1)
+        self.assertEqual(
+            command[command.index("--profile-id") + 1], self.PROFILE.profile_id
+        )
+        self.assertEqual(
+            command[command.index("--profile-sha256") + 1],
+            self.PROFILE.manifest_sha256,
+        )
+        self.assertEqual(
+            command[command.index("--kernel-image-sha256") + 1],
+            self.PROFILE.kernel_image_sha256,
+        )
 
     def test_minimum_battery_is_bounded(self) -> None:
         self.assertEqual(GHOSTLOCK.min_battery_value("0"), 0)

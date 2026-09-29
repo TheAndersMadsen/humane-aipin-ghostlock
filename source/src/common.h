@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified for the GhostLock Humane AI Pin port; see docs/PROVENANCE.md.
+
 #ifndef COMMON_H
 #define COMMON_H
 
@@ -316,8 +319,9 @@ int is_kernel_ptr(uintptr_t value);
 int is_direct_ptr(uintptr_t value);
 int direct_pselect_write_once(
     uintptr_t target, uintptr_t value, int shape, int idx);
-int direct_pselect_write_followup_once(
+int direct_pselect_write_repaired_once(
     uintptr_t target, uintptr_t value, int shape, int idx,
-    uintptr_t followup_target, int followup_idx);
+    uintptr_t repair_target, int repair_idx,
+    uintptr_t selinux_target, int selinux_idx);
 
 #endif

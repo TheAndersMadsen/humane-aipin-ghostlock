@@ -22,6 +22,7 @@ FORBIDDEN_NAMES = {
 }
 FORBIDDEN_SUFFIXES = {
     ".img",
+    ".log",
     ".raw",
     ".zip",
 }
@@ -36,7 +37,7 @@ CONTENT_PATTERNS = {
 
 
 def candidate_paths() -> list[Path]:
-    output = subprocess.check_output(
+    result = subprocess.run(
         [
             "git",
             "-C",
@@ -46,9 +47,26 @@ def candidate_paths() -> list[Path]:
             "--others",
             "--exclude-standard",
             "-z",
-        ]
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
     )
-    return [ROOT / item.decode() for item in output.split(b"\0") if item]
+    if result.returncode == 0:
+        return [ROOT / item.decode() for item in result.stdout.split(b"\0") if item]
+
+    # Release archives may not carry Git metadata.  Mirror the repository's
+    # ignore boundary so the same audit can still inspect source exports.
+    ignored_parts = {".git", ".agents", ".codex", "__pycache__", "build", "dist"}
+    ignored_suffixes = {".pyc", ".pyo", ".zip", ".img", ".raw", ".bin", ".elf", ".so"}
+    paths: list[Path] = []
+    for path in ROOT.rglob("*"):
+        relative = path.relative_to(ROOT)
+        if any(part in ignored_parts for part in relative.parts):
+            continue
+        if path.is_file() and path.suffix.lower() not in ignored_suffixes:
+            paths.append(path)
+    return paths
 
 
 def main() -> int:

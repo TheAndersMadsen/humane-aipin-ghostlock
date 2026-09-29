@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import sys
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -12,6 +15,18 @@ import ghostlock_prod_runner as RUNNER  # noqa: E402
 
 
 class ProdRunnerTest(unittest.TestCase):
+    class FakeAdb:
+        def __init__(self, *, output: str = "", returncode: int = 0):
+            self.output = output
+            self.returncode = returncode
+            self.commands: list[str] = []
+
+        def shell(self, command, *, timeout=30, check=True):
+            self.commands.append(command)
+            return subprocess.CompletedProcess(
+                ["adb", "shell", command], self.returncode, self.output
+            )
+
     def state(self, **overrides):
         values = {
             "serial": "SERIAL",
@@ -41,6 +56,47 @@ class ProdRunnerTest(unittest.TestCase):
     def test_uid_zero_is_rejected(self) -> None:
         with self.assertRaises(RUNNER.RunnerError):
             self.assert_valid(self.state(uid="0", context="u:r:su:s0"))
+
+    def test_default_output_dir_uses_host_temp_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            RUNNER.tempfile, "gettempdir", return_value=temporary
+        ):
+            path = RUNNER.default_output_dir("20260922-011428")
+        self.assertEqual(
+            path,
+            Path(temporary) / "ghostlock-prod-equivalent-20260922-011428",
+        )
+
+    def test_launch_power_gate_requires_level_and_external_power(self) -> None:
+        adb = self.FakeAdb(
+            output="AC powered: false\nUSB powered: true\nlevel: 87\n"
+        )
+        self.assertEqual(RUNNER.assert_power(adb, 20), (87, True))
+        with self.assertRaisesRegex(RUNNER.RunnerError, "at least 90%"):
+            RUNNER.assert_power(adb, 90)
+
+        unplugged = self.FakeAdb(
+            output="AC powered: false\nUSB powered: false\nlevel: 100\n"
+        )
+        with self.assertRaisesRegex(RUNNER.RunnerError, "not connected"):
+            RUNNER.assert_power(unplugged, 20)
+
+    def test_attempt_claim_is_boot_specific_and_atomic(self) -> None:
+        boot_id = "12345678-1234-1234-1234-123456789abc"
+        adb = self.FakeAdb()
+        claim = RUNNER.claim_boot_attempt(adb, boot_id)
+        self.assertEqual(
+            claim,
+            "/data/local/tmp/.ghostlock-aipin-attempt."
+            + boot_id
+            + ".lock",
+        )
+        self.assertIn("mkdir", adb.commands[0])
+        self.assertIn(boot_id, adb.commands[0])
+
+        already_claimed = self.FakeAdb(returncode=1)
+        with self.assertRaisesRegex(RUNNER.RunnerError, "already claimed"):
+            RUNNER.claim_boot_attempt(already_claimed, boot_id)
 
     def test_production_boundary_is_accepted(self) -> None:
         self.assert_valid(self.state())

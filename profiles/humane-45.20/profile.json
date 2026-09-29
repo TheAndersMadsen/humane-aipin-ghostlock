@@ -9,6 +9,7 @@
   "kernel_machine": "aarch64",
   "kernel_image_sha256": "d4f4e0deb20871fce207f1f095ba1934162081c2f10afaccbb2e6a1e938719fb",
   "accepted_slots": [
+    "_a",
     "_b"
   ],
   "accepted_abis": [

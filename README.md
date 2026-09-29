@@ -23,16 +23,17 @@ anything. A mismatch stops the run.
 | Firmware | `qti/atoll/atoll:12/SKQ1.230401.001/101.000470.45.20:user/release-keys` |
 | Android | 12 |
 | Kernel | `4.14.190-perf`, built `Mon Nov 4 18:37:23 PST 2024` |
-| Slot | `_b` only |
+| Slot | `_a` or `_b` |
 | Kernel architecture | `aarch64` |
 | Android ABI | `arm64-v8a` |
 | Profile ID | `humane-aipin-45.20-nov4` |
 | Build project | `humane-aipin-45.20` |
 | Kernel Image SHA-256 | `d4f4e0deb20871fce207f1f095ba1934162081c2f10afaccbb2e6a1e938719fb` |
-| Release-candidate replay | Pending final clean-boot replay |
+| Prior sequence replay | Slot `_a`: 1 success in 2 clean-boot attempts |
+| Repair-first sequence replay | Pending clean-boot physical replay |
 
-Slot `_a`, developer firmware, nearby firmware versions, and other Qualcomm
-`atoll` products are rejected. See [compatibility details](docs/COMPATIBILITY.md).
+Developer firmware, nearby firmware versions, and other Qualcomm `atoll`
+products are rejected. See [compatibility details](docs/COMPATIBILITY.md).
 A matching Android fingerprint is not enough to bypass this check: A/B slots
 can carry different boot images and kernel layouts under the same userspace
 build identity.
@@ -42,6 +43,12 @@ launcher, runner, generated native preflight, allocator geometry, minimal
 symbols, and built payload are bound to that same manifest. Adding a slot to a
 manifest still requires a clean-boot physical replay of the exact profiled
 kernel Image.
+
+The earlier slot-`_a` sequence completed the production-equivalent chain on
+the second of two clean-boot attempts. Three later runs reset during its
+credential transition. The current source repairs `init_cred` immediately
+after each credential-pointer write, before the SELinux follow-up, and remains
+pending a clean-boot physical replay. Root remains boot-scoped.
 
 ## Before you begin
 
@@ -168,7 +175,7 @@ attach that directory or a raw Android bugreport to an issue.
 Create a reduced report instead:
 
 ```sh
-./ghostlock report /private/tmp/ghostlock-aipin-TIMESTAMP --output ghostlock-report.json
+./ghostlock report /tmp/ghostlock-aipin-TIMESTAMP --output ghostlock-report.json
 ```
 
 Review the JSON before sharing it. The redactor omits serials, boot IDs, host

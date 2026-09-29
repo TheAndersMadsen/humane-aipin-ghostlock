@@ -24,12 +24,14 @@ Apache-2.0 `LICENSE` is preserved at the repository root.
 | `source/src/perf_reclaim_*` | New | Same-PFN runtime gate and address math |
 | `source/src/reclaim_hold.*` | New | Socket-buffer reclaim ownership |
 | `source/src/slide_supervisor.*` | New | Child framing, deadlines, and cleanup |
+| `source/src/cred_followup.*`, `source/tests/cred_followup_test.c` | New | Repair-before-SELinux transition invariant and host regression |
 | `profiles/*`, `ghostlock_profile.py` | New | Strict target manifests, symbol binding, and host matching |
 | `runner/*`, `tools/*`, `scripts/*` | New | Host guardrails, KASLR parser, launcher, redaction, and release audit |
 | `docs/*` and project metadata | New | Public documentation and release process |
 
-Modified target files carry SPDX identifiers and modification notices. This
-table provides the prominent change notice required by Apache-2.0 section 4.
+The modified credential-route files and new repair-first helper carry SPDX
+identifiers and provenance notices. This table provides the repository-wide
+change map for Apache-2.0 section 4.
 
 ## Unlicensed prior art
 

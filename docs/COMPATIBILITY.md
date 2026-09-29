@@ -13,7 +13,7 @@ Version 0.1.0 accepts one profile:
 | Exact kernel release (`uname -r`) | `4.14.190-perf` |
 | Exact kernel version (`uname -v`) | `#1 SMP PREEMPT Mon Nov 4 18:37:23 PST 2024` |
 | Exact kernel machine (`uname -m`) | `aarch64` |
-| Active slot | `_b` |
+| Active slot | `_a` or `_b` |
 | CPU ABI property (`ro.product.cpu.abi`) | `arm64-v8a` |
 | Kernel Image SHA-256 | `d4f4e0deb20871fce207f1f095ba1934162081c2f10afaccbb2e6a1e938719fb` |
 | Minimal symbols SHA-256 | `b6bc1dccc155de70881b0abfe708a0e3dba626b819dc03d56686ab9c07517f9b` |
@@ -31,17 +31,22 @@ separate layout hash beside the hardcoded kernel offsets prevents a manifest
 for another Image from silently reusing this target implementation.
 
 The build fingerprint is a userspace property and does not prove that both A/B
-boot slots contain the same kernel. Never remove the slot or kernel gate merely
-because the fingerprint matches.
+boot slots contain the same kernel. The decompressed 45.20 `boot_a` Image was
+independently hashed and exactly matches the profiled Image SHA-256 above. This
+is why `_a` can reuse the existing Image-specific symbols, offsets, and
+allocator geometry. A nearby `boot_b` from older firmware does not match and
+is still rejected by the complete live identity gates.
 
-If slot `_a` is proven to boot this exact Image, support can be added to the
-existing manifest only after a clean-boot physical replay. If it boots a
-different Image, it needs a new target project with independently derived
-symbols, offsets, geometry, and replay evidence.
+The earlier slot-`_a` sequence had one successful production-equivalent replay
+from two clean-boot physical attempts on the exact accepted retail profile.
+Three later runs reset during its credential transition. The repair-first
+credential sequence now in source is host-verified but still requires a new
+clean-boot physical replay. This evidence applies only to the Image hash and
+complete live identity above; it does not extend support to the older,
+nonmatching `boot_b` Image found in the same private eMMC capture.
 
 ## Explicitly unsupported
 
-- slot `_a`;
 - userdebug, engineering, or test-key builds;
 - any build other than `101.000470.45.20`;
 - devices that merely share the Qualcomm `atoll` platform;

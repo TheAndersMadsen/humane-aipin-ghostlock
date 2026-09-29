@@ -14,7 +14,7 @@ attempt.
 The check must show:
 
 - the exact supported fingerprint, kernel version, and machine;
-- slot `_b`;
+- slot `_a` or `_b`;
 - UID 2000 in `u:r:shell:s0`;
 - SELinux `Enforcing`;
 - an authorized ADB state;

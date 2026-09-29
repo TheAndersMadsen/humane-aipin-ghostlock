@@ -11,6 +11,8 @@
 #define SLIDE_ROUTE_DONE_TIMEOUT_MS 9000
 #define SLIDE_ROUTE_POLL_USEC 1000
 #define SLIDE_ROUTE_DEBUG_TAG "[DEBUG-slide-route]"
+#define SLIDE_RAW_LINE(text) \
+  ((void)syscall(SYS_write, STDERR_FILENO, (text), sizeof(text) - 1))
 
 #define SLIDE_TRACEFS_ROOT "/sys/kernel/tracing"
 
@@ -457,6 +459,7 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
     int entered = atomic_load(&slide_consume_enter_sched) + 1;
     atomic_store(&slide_consume_enter_sched, entered);
     atomic_store(&slide_consume_calls, calls + 1);
+    SLIDE_RAW_LINE("[DEBUG-slide-route] consumer sched_setattr enter\n");
     errno = 0;
     /*
      * nice 19 makes the rewritten stale waiter lower priority than fake_w0.
@@ -465,6 +468,7 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
      */
     long ret = sched_setattr_tid(tid, PSELECT_CONSUMER_NICE);
     int saved_errno = errno;
+    SLIDE_RAW_LINE("[DEBUG-slide-route] consumer sched_setattr return\n");
     atomic_store(&slide_consume_last_sched_ret, (int)ret);
     atomic_store(&slide_consume_last_sched_errno, saved_errno);
     if (ret == 0) {

@@ -39,9 +39,15 @@ while IFS="$tab" read -r profile_id project manifest_path; do
     --profile "$manifest_path" --payload "$payload"
   first_payload="$temporary_dir/$profile_id.first.so"
   cp "$payload" "$first_payload"
+  make -C source clean
   ./ghostlock build --profile "$profile_id"
   cmp "$first_payload" "$payload"
 done <"$temporary_dir/profiles.tsv"
 
-git diff --check
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git diff --check
+  git diff --cached --check
+else
+  echo "source export: git diff checks unavailable"
+fi
 echo "release verification passed"

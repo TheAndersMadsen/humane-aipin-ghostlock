@@ -4,7 +4,9 @@
 
 - Centralize exact compatibility data in strict, hash-bound profile manifests.
 - Bind host checks, native preflight, symbols, allocator geometry, and payloads
-  to one profile while preserving slot `_b` as the only replayed target.
+  to one profile, and accept slot `_a` after its decompressed Image was proven
+  byte-identical to the profiled 45.20 Image and a clean-boot physical replay
+  completed the production-equivalent chain.
 - Add macOS host CI, serial-redacted check diagnostics, and clearer report
   errors.
 - Batch each runner state capture into one strict tagged shell snapshot while
@@ -15,6 +17,10 @@
 - Recheck boot identity inside both the atomic claim and exploit exec shell,
   preserve user cancellation through cleanup failures, and support repository
   checkout paths containing spaces.
+- Repair `init_cred` immediately after each collateral credential-pointer
+  write, and permit the SELinux follow-up only after that repair is routed.
+- Reject terminal log files from release trees and document the repair-first
+  helper's Apache-2.0 provenance.
 
 ## 0.1.0 - 2026-09-20
 
